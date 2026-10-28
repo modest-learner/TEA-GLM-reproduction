@@ -1,191 +1,156 @@
 import pandas as pd
+import re
 import torch
+from pathlib import Path
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from torch_geometric.data import Data, Batch
-from .utils import *
-from .conversation import conv_templates, SeparatorStyle
-
+from .utils import load_checkpoint
+from .conversation import conv_templates
 
 IGNORE_TOKEN_ID = -100
+ECOM_NAMES = {'children': 'book_children', 'history': 'book_history',
+              'computer': 'computer', 'photo': 'photo', 'sports': 'sports'}
 
 
-def get_instructions(data_path):
-    df = pd.read_json(data_path)
-    df['edge_num'] = df.apply(get_edge_num, axis=1)
+def get_instructions(data_path, max_samples=None):
+    df = pd.read_json(data_path).reset_index(drop=True)
+    # Keep the full ontology even when evaluating a small smoke-test subset.
+    classes = sorted(set(df.loc[df['task'] == 'nc', 'output']))
+    if max_samples is not None:
+        df = df.iloc[:max_samples].copy()
+    if df.empty:
+        raise ValueError(f'No instructions found in {data_path}')
     df['gpt'] = df['output']
-    df = df.reset_index(drop=True)
-    df = df.sample(n=20, ignore_index=True)
-
+    df.attrs['class_labels'] = classes
     return df
 
 
 def preprocess(instruction, tokenizer, max_length, mode='train'):
-    conv = conv_templates["vicuna_v1_1"].copy()
-    assert conv.sep_style == SeparatorStyle.TWO
-
-    roles = conv.roles
-    tokenizer.padding_side = 'right' if mode == 'train' else 'left'
-
-    # Apply prompt templates
-    conversations = []
-    conv.append_message(roles[0], instruction["prompt"])
-    # conv.append_message(roles[0], "What is the meaning of AI?")
+    conv = conv_templates['vicuna_v1_1'].copy()
+    conv.append_message(conv.roles[0], instruction['prompt'])
+    conv.append_message(conv.roles[1], None)
+    prompt = conv.get_prompt()
+    # Match the complete Vicuna conversation's tokenization exactly. Locate
+    # the shared prefix instead of assuming tokenizer-specific +/-2 offsets.
+    prefix_ids = tokenizer(prompt, add_special_tokens=True).input_ids
     if mode == 'train':
-        conv.append_message(roles[1], instruction["gpt"])
+        ids = tokenizer(prompt + ' ' + instruction['gpt'] + conv.sep2,
+                        add_special_tokens=True).input_ids
+        boundary = 0
+        for prefix_token, full_token in zip(prefix_ids, ids):
+            if prefix_token != full_token:
+                break
+            boundary += 1
+        if boundary >= len(ids):
+            raise ValueError('An instruction has no answer tokens')
+        labels = [IGNORE_TOKEN_ID] * boundary + ids[boundary:]
     else:
-        conv.append_message(roles[1], None)
-    conversations.append(conv.get_prompt())
-
-    # Tokenize conversations
-    input_ids = tokenizer(
-        conversations,
-        return_tensors="pt",
-        padding="max_length",
-        max_length=max_length,
-        truncation=True,
-    ).input_ids
-    
-    if mode != 'train':
-        end_token = "</s>"
-        targets = tokenizer(
-            [instruction["gpt"]+end_token],
-            return_tensors="pt",
-            padding="max_length",
-            max_length=100,
-            truncation=True,
-        ).input_ids
-    else:
-        targets = input_ids.clone()
-
-        # Mask targets. Only compute loss on the assistant outputs.
-        sep = conv.sep + conv.roles[1] + ": "
-        for conversation, target in zip(conversations, targets):
-            total_len = int(target.ne(tokenizer.pad_token_id).sum())
-
-            turns = conversation.split(conv.sep2)
-            cur_len = 1
-            target[:cur_len] = IGNORE_TOKEN_ID
-            for i, turn in enumerate(turns):
-                if turn == "":
-                    break
-                turn_len = len(tokenizer(turn).input_ids)
-
-                parts = turn.split(sep)
-                if len(parts) != 2:
-                    break
-                parts[0] += sep
-                # "-2" is hardcoded for the Llama tokenizer to make the offset correct. the first label is not _, but _label
-                instruction_len = len(tokenizer(parts[0]).input_ids) - 2
-
-                if i != 0 and not tokenizer.legacy:
-                    # The legacy and non-legacy modes handle special tokens differently
-                    instruction_len -= 1
-
-                # Ignore the user instructions
-                target[cur_len : cur_len + instruction_len] = IGNORE_TOKEN_ID
-                cur_len += turn_len
-
-                if i != 0 and not tokenizer.legacy:
-                    # The legacy and non-legacy modes handle special tokens differently
-                    cur_len -= 1
-
-            target[cur_len:] = IGNORE_TOKEN_ID
-
-
-            if cur_len < max_length:
-                if cur_len != total_len:
-                    target[:] = IGNORE_TOKEN_ID
-                    print(
-                        f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
-                        f" #turn = {len(turns) - 1}. (ignored)"
-                    )
-
-    return dict(
-        input_ids=input_ids,
-        target_ids=targets,
-        attention_mask=input_ids.ne(tokenizer.pad_token_id),
-        text=conversations[0]
-    )
+        ids = prefix_ids
+        labels = tokenizer(instruction['gpt'] + conv.sep2, add_special_tokens=False).input_ids
+    if len(ids) > max_length:
+        raise ValueError(f'Instruction needs {len(ids)} tokens, exceeding '
+                         f'--max_text_length {max_length}. Increase the limit; '
+                         'truncation can remove graph tokens or answer supervision.')
+    return dict(input_ids=torch.tensor([ids], dtype=torch.long),
+                target_ids=torch.tensor([labels], dtype=torch.long),
+                attention_mask=torch.ones(1, len(ids), dtype=torch.bool), text=prompt)
 
 
 class InstructionDataset(Dataset):
-    def __init__(self, tokenizer, args, mode='train') -> None:
-        super().__init__()
-        self.tokenizer = tokenizer
-        self.args = args
-        self.mode = mode
-
-        if args.inference:
-            self.instructions = get_instructions(f"./instruction/{args.test_dataset}/{args.test_dataset}_dataset_{self.mode}.json")
-        else:
-            self.instructions = get_instructions(f"./instruction/{args.dataset}/{args.dataset}_dataset_{self.mode}.json")
-
-        self.paper = torch.load(f"./data/graph_data_paper.pt")
-        self.ecom = torch.load(f"./data/graph_data_ecommercial.pt")
-        self.name2data = {
-            'arxiv': self.paper['arxiv'],
-            'pubmed': self.paper['pubmed'],
-            'cora': self.paper['cora'],
-            'children': self.ecom['book_children'],
-            'history': self.ecom['book_history'],
-            'computer': self.ecom['computer'],
-            'photo': self.ecom['photo'],
-            'sports': self.ecom['sports'],
-        }
-        args.gnn_input = self.name2data[args.dataset].x.shape[1]
-        print(f'Hidden dim: {args.gnn_input}')
+    def __init__(self, tokenizer, args, mode='train'):
+        self.tokenizer, self.args, self.mode = tokenizer, args, mode
+        name = args.test_dataset if args.inference else args.dataset
+        instruction_path = Path(args.instruction_dir) / name / f'{name}_dataset_{mode}.json'
+        self.instruction_path = instruction_path
+        self.instructions = get_instructions(instruction_path, args.max_samples)
+        self.class_labels = self.instructions.attrs['class_labels']
+        self.text_only = args.method == 'vicuna_text'
+        if self.text_only and set(self.instructions['task']) != {'nc'}:
+            raise ValueError('The text-only comparison is defined for node classification')
+        self.node_token_ids = (torch.empty(0, dtype=torch.long) if self.text_only else
+                              torch.tensor(tokenizer.convert_tokens_to_ids(
+                                  [f'<Node {i}>' for i in range(1, args.num_token + 1)])))
+        if not self.text_only and len(set(self.node_token_ids.tolist())) != args.num_token:
+            raise ValueError('Register each <Node i> as a special token before creating the dataset')
+        self.name2data = {}
+        names = set(self.instructions['data'])
+        for filename, selected in (
+            ('graph_data_paper.pt', names - ECOM_NAMES.keys()),
+            ('graph_data_ecommercial.pt', names & ECOM_NAMES.keys()),
+        ):
+            if selected:
+                graphs = load_checkpoint(Path(args.data_dir) / filename, graph_data=True)
+                for data_name in selected:
+                    self.name2data[data_name] = graphs[ECOM_NAMES.get(data_name, data_name)]
+        widths = {graph.x.shape[1] for graph in self.name2data.values()}
+        if len(widths) != 1:
+            raise ValueError(f'Incompatible node feature dimensions: {widths}')
+        args.gnn_input = widths.pop()
         args.edge_dim = None
-        
+
     def __len__(self):
         return len(self.instructions)
 
-    def __getitem__(self, idx):
-        raw = self.instructions.iloc[idx]
-        instruction = raw.copy()
-        tokens = " ".join([f"<Node {i}>" for i in range (1, 1 + self.args.num_token)])
-        data_name = instruction['data']
-
-        # remove abstract for citation dataset
-        if data_name in ['children', 'history', 'computer', 'sports', 'photo']:
-            instruction['prompt'] = raw['prompt'].replace("<Node 1>", tokens)
+    def prepare_instruction(self, idx):
+        instruction = self.instructions.iloc[idx].copy()
+        prompt = instruction['prompt']
+        # Citation instructions include abstracts; the paper uses titles only.
+        if instruction['data'] not in ECOM_NAMES and 'Abstract: ' in prompt and 'Title: ' in prompt:
+            before, remainder = prompt.split('Abstract: ', 1)
+            prompt = before + 'Title: ' + remainder.split('Title: ', 1)[1]
+        if self.text_only:
+            # Matched baseline: remove graph tokens only. Keep every other
+            # character, the same title/description, question and class list.
+            instruction['prompt'] = re.sub(r'<Node \d+>', '', prompt)
         else:
-            instruction['prompt'] = (raw['prompt'].split('Abstract: ')[0] + 'Title: ' + raw['prompt'].split('Title: ')[1]).replace("<Node 1>", tokens)
+            tokens = ' '.join(f'<Node {i}>' for i in range(1, self.args.num_token + 1))
+            instruction['prompt'] = prompt.replace('<Node 1>', tokens)
+        return instruction
 
-        out_dict = preprocess(instruction, self.tokenizer, self.args.max_text_length, self.mode)
-        
-        # graph data
-        graph = Data()
-        graph.edge_index = torch.LongTensor(instruction['edge_index'])
-        node_list = torch.LongTensor(instruction['node_set'])
-        graph.x = self.name2data[data_name].x[node_list].to(dtype=torch.bfloat16)
-        graph.lp = True if instruction['task'] == 'lp' else False
-        graph.edge_attr = None
-        is_node = (out_dict['input_ids'] >= 32000)
+    def prompt_text(self, idx):
+        conv = conv_templates['vicuna_v1_1'].copy()
+        conv.append_message(conv.roles[0], self.prepare_instruction(idx)['prompt'])
+        conv.append_message(conv.roles[1], None)
+        return conv.get_prompt()
 
-        out_dict['is_node'] = is_node
-        out_dict['graph'] = graph
-
-        return out_dict
+    def __getitem__(self, idx):
+        instruction = self.prepare_instruction(idx)
+        out = preprocess(instruction, self.tokenizer, self.args.max_text_length, self.mode)
+        out['sample_index'] = idx
+        if self.text_only:
+            # No subgraph or graph-derived embeddings enter the baseline LLM.
+            out['is_node'] = torch.zeros_like(out['input_ids'], dtype=torch.bool)
+            return out
+        node_list = torch.tensor(instruction['node_set'], dtype=torch.long)
+        edge_index = torch.tensor(instruction['edge_index'], dtype=torch.long).reshape(2, -1)
+        if node_list.numel() == 0 or (instruction['task'] == 'lp' and node_list.numel() < 2):
+            raise ValueError(f'Invalid target nodes in instruction {idx}')
+        if edge_index.numel() and (edge_index.min() < 0 or edge_index.max() >= node_list.numel()):
+            raise ValueError(f'Non-local edge indices in instruction {idx}')
+        if instruction['task'] == 'lp' and self.args.remove_target_edge:
+            target_edge = ((edge_index[0] == 0) & (edge_index[1] == 1)) | ((edge_index[0] == 1) & (edge_index[1] == 0))
+            edge_index = edge_index[:, ~target_edge]
+        out['graph'] = Data(x=self.name2data[instruction['data']].x[node_list].float(),
+                            edge_index=edge_index, lp=instruction['task'] == 'lp')
+        out['is_node'] = (out['input_ids'].unsqueeze(-1) == self.node_token_ids).any(-1)
+        if out['is_node'].sum().item() != self.args.num_token:
+            raise ValueError(f'Instruction {idx} must contain exactly {self.args.num_token} graph tokens')
+        return out
 
     def collate_fn(self, batch):
-        batch_entry = {}
-        input_ids = []
-        target_ids = []
-        attention_mask = []
-        is_node = []
-        graph = []
-        
-        for i, entry in enumerate(batch):
-            input_ids.append(entry['input_ids'])
-            target_ids.append(entry['target_ids'])
-            attention_mask.append(entry['attention_mask'])
-            is_node.append(entry['is_node'])
-            graph.append(entry['graph'])
-        
-        batch_entry['input_ids'] = torch.cat(input_ids, dim=0) # tensor
-        batch_entry['target_ids'] = torch.cat(target_ids, dim=0) # tensor
-        batch_entry['attn_mask']= torch.cat(attention_mask, dim=0) # tensor
-        batch_entry['is_node'] = torch.cat(is_node, dim=0) # tensor
-        batch_entry['graph'] = Batch.from_data_list(graph)
-
-        return batch_entry      # Real batch data.
+        def pad(key, value, left=False):
+            values = [entry[key].squeeze(0) for entry in batch]
+            if left:
+                values = [v.flip(0) for v in values]
+            result = pad_sequence(values, batch_first=True, padding_value=value)
+            return result.flip(1) if left else result
+        left = self.mode != 'train'
+        collated = dict(input_ids=pad('input_ids', self.tokenizer.pad_token_id, left),
+                    target_ids=pad('target_ids', IGNORE_TOKEN_ID if not left else self.tokenizer.pad_token_id),
+                    attn_mask=pad('attention_mask', False, left),
+                    is_node=pad('is_node', False, left),
+                    sample_index=torch.tensor([entry['sample_index'] for entry in batch], dtype=torch.long))
+        if not self.text_only:
+            collated['graph'] = Batch.from_data_list([entry['graph'] for entry in batch])
+        return collated

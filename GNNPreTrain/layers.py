@@ -6,6 +6,7 @@ from torch_geometric.nn.dense.linear import Linear
 import torch.nn.functional as F
 
 class SAGEConv(SAGEConv):
+    propagate_type = {'x': 'OptPairTensor', 'edge_attr': 'OptTensor'}
     def __init__(self, in_channels, out_channels: int, aggr = "mean", normalize: bool = False, root_weight: bool = True, project: bool = False, bias: bool = True, edge_dim=None, **kwargs):
         super().__init__(in_channels, out_channels, aggr, normalize, root_weight, project, bias, **kwargs)
         if edge_dim is not None:
@@ -28,7 +29,7 @@ class SAGEConv(SAGEConv):
         if self.lin_edge is not None and edge_attr is not None:
             edge_attr = self.lin_edge(edge_attr)
 
-        # propagate_type: (x: OptPairTensor)
+        # propagate_type: (x: OptPairTensor, edge_attr: OptTensor)
         out = self.propagate(edge_index, x=x, size=size, edge_attr=edge_attr)
         out = self.lin_l(out)
 

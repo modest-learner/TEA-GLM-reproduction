@@ -2,7 +2,10 @@ import torch
 from torch_geometric.nn import global_add_pool, global_mean_pool, global_max_pool, GlobalAttention, Set2Set
 import torch.nn.functional as F
 from tqdm import tqdm
-from layers import SAGEConv
+try:
+    from .layers import SAGEConv
+except ImportError:
+    from layers import SAGEConv
 from torch_geometric.nn.conv import GATConv, GCNConv
 
 class GraphSAGE(torch.nn.Module):
@@ -43,16 +46,12 @@ class GraphSAGE(torch.nn.Module):
         elif graph_pooling == "max":
             self.pool = global_max_pool
         elif graph_pooling == "attention":
-            if self.JK == "concat":
-                self.pool = GlobalAttention(gate_nn = torch.nn.Linear((self.num_layer + 1) * emb_dim, 1))
-            else:
-                self.pool = GlobalAttention(gate_nn = torch.nn.Linear(emb_dim, 1))
+            self.pool = GlobalAttention(gate_nn=torch.nn.Linear(out_channels, 1))
         elif graph_pooling[:-1] == "set2set":
             set2set_iter = int(graph_pooling[-1])
-            if self.JK == "concat":
-                self.pool = Set2Set((self.num_layer + 1) * emb_dim, set2set_iter)
-            else:
-                self.pool = Set2Set(emb_dim, set2set_iter)
+            self.pool = Set2Set(out_channels, set2set_iter)
+        else:
+            raise ValueError(f'Unknown graph pooling: {graph_pooling}')
 
     def forward(self, x, edge_index, edge_attr=None, batch=None):
         for i, conv in enumerate(self.convs):

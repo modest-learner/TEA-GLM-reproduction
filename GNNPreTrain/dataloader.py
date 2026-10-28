@@ -1,7 +1,10 @@
 from torch_geometric.loader.node_loader import NodeLoader
 import torch
 from copy import deepcopy
-from sampler import NodeNegativeSampler
+try:
+    from .sampler import NodeNegativeSampler
+except ImportError:  # Direct script execution from GNNPreTrain.
+    from sampler import NodeNegativeSampler
 from torch_geometric.sampler import (
     NodeSamplerInput,
     SamplerOutput,

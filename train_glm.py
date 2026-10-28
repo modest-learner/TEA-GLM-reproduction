@@ -1,241 +1,206 @@
-import json
-import time
-import transformers
-import torch
-import os
+"""TEA-GLM training and inference entry point (original repository layout)."""
 import gc
-from tqdm import tqdm
-from pathlib import Path
+import traceback
+from copy import deepcopy
+from contextlib import nullcontext
 from datetime import timedelta
+from pathlib import Path
 
-from config import *
-from model import *
-from utils import *
-
-from accelerate import Accelerator
-from accelerate import DistributedDataParallelKwargs
+import torch
+from tqdm import tqdm
+from accelerate import Accelerator, DistributedDataParallelKwargs
 from accelerate.utils import InitProcessGroupKwargs
+from transformers import AutoTokenizer
 
-from transformers import LlamaTokenizer
+from config import parse_args
+from model.language_model import generation_kwargs, resolved_generation_settings
+from utils.trainer_base import TrainerBase
+from utils.utils import seed_everything, print_trainable_params, InferenceRecorder
 
 
-def main(args, SEED):
-    run_time = time.strftime("%Y%m%d%H%M", time.localtime())
-    wandb_name = f"{args.prefix}_EXP{SEED}_{run_time}"
+def main(args, seed, accelerator):
     if args.inference:
-        group = f"{args.dataset}_{args.test_dataset}"
-    else:
-        group = f"{args.dataset}"
-    accelerator.init_trackers(project_name=f"{args.project}",
-                              init_kwargs={"wandb":
-                                               {"tags": [args.dataset, args.backbone],
-                                                "group": group,
-                                                "name": wandb_name,
-                                                "config": args}
-                                           },
-                              )
-
-    seed_everything(seed=SEED)
-    accelerator.print(args)
-
+        output_parent = Path(args.results_dir) / args.test_dataset
+        if ((output_parent / args.prefix).exists() or
+                (output_parent / f'{args.prefix}_model_results.txt').exists()):
+            raise FileExistsError('Inference outputs already exist; choose a new --prefix or --results_dir')
+    seed_everything(seed)
+    args.run_seed = seed
+    if args.log_with:
+        accelerator.init_trackers(args.project, config=vars(args))
     with accelerator.main_process_first():
-
-        tokenizer = LlamaTokenizer.from_pretrained(args.backbone)
-        tokenizer.pad_token=tokenizer.unk_token
-        special={'additional_special_tokens': ['<Node {}>'.format(i) for i in range(1, 110)]}   # Add a new special token as place holder
-        tokenizer.add_special_tokens(special)
-
-    accelerator.wait_for_everyone()
-
-    cur_device = torch.cuda.current_device()
-    trainer = TrainerBase(args, cur_device)
-
-    accelerator.print('Building DataLoader')
-    if not args.inference:
-        train_loader = trainer.create_dataloader(tokenizer)
-    else:
-        test_loader = trainer.create_dataloader(tokenizer)
-        train_loader = test_loader
-
-    accelerator.print('Building Model')
+        tokenizer = AutoTokenizer.from_pretrained(args.backbone, use_fast=False)
+        if tokenizer.pad_token_id is None:
+            tokenizer.pad_token = tokenizer.unk_token or tokenizer.eos_token
+        if args.method == 'tea_glm':
+            tokenizer.add_special_tokens({'additional_special_tokens':
+                                          [f'<Node {i}>' for i in range(1, args.num_token + 1)]})
+    args.pad_token_id = tokenizer.pad_token_id
+    trainer = TrainerBase(args, accelerator.device)
+    loader = trainer.create_dataloader(tokenizer)
     first_model, model = trainer.create_model()
-    torch.set_default_tensor_type(torch.FloatTensor)
-
-    accelerator.print('Building Optimizer')
-    optimizer, warmup_scheduler = trainer.create_optimizer_and_scheduler(first_model, model, train_loader)
-
-    trainable_params, all_param = print_trainable_params(first_model, model)
-    accelerator.print(
-        f"trainable params: {trainable_params} || all params: {all_param} || trainable%: {100 * trainable_params / all_param}")
-
-    if not os.path.exists('./saved_model/first_model'):
-        os.mkdir('./saved_model/first_model')
-
-    first_model_path = './saved_model/first_model/{}_fm_{}_epoch{}_{}.pth'
-    model_path = './saved_model/model/{}_m_{}_epoch{}_{}.pth'
-
-
-    if not args.inference:
-        first_model, model, train_loader, optimizer, warmup_scheduler = accelerator.prepare(first_model, model, train_loader,
-                                                                                        optimizer, warmup_scheduler)
-        accelerator.print('Training')
-        num_training_steps = args.epoch * len(train_loader)
-        progress_bar = tqdm(range(num_training_steps))
-        for epoch in range(args.epoch):
-
-            model.train()
-            first_model.train()
-            epoch_loss, accum_loss = 0., 0.
-
-            for step, batch in enumerate(train_loader):
-                with accelerator.accumulate(model):
-                    optimizer.zero_grad()
-
-                    input_ids = batch['input_ids']
-                    is_node = batch['is_node']
-                    labels = batch["target_ids"]
-                    attention_mask = batch['attn_mask']
-                    graph = batch['graph']
-                    
-                    embeds = first_model(
-                        input_ids=input_ids,
-                        is_node=is_node,
-                        graph=graph
-                    )
-                    output=model(inputs_embeds=embeds, attention_mask=attention_mask, labels=labels)
-
-                    loss = output['loss']
-                    accelerator.backward(loss)
-
-                    accelerator.clip_grad_norm_(optimizer.param_groups[0]['params'], 0.1)
-                    accelerator.clip_grad_norm_(optimizer.param_groups[1]['params'], 0.1)
-
-                    optimizer.step()
-                    warmup_scheduler.step()
-
-                    epoch_loss, accum_loss = epoch_loss + loss.item(), accum_loss + loss.item()
-
-
-                if (step + 1) % args.grad_steps == 0:
-                    graph_lr = optimizer.param_groups[0]["lr"]
-                    lora_lr = optimizer.param_groups[1]["lr"]
-
-                    accelerator.print({'Graph Lr': graph_lr, 'Lora Lr': lora_lr})
-                    accelerator.print({'Accum Loss': accum_loss / args.grad_steps})
-                    accelerator.log({'Graph Lr': graph_lr, 'Lora Lr': lora_lr})
-                    accelerator.log({'Accum Loss': accum_loss / args.grad_steps})
-                    accum_loss = 0.
-
-                progress_bar.update(1)
-
-            accelerator.print(f"Epoch: {epoch}|{args.epoch}: Train Loss (Epoch Mean): {epoch_loss / len(train_loader)}")
-            accelerator.log({
-                'Epoch': epoch,
-                'Loss': epoch_loss / len(train_loader)
-                })
-
-            # train only one epoch and save model
-            if args.epoch == 1:
-                accelerator.wait_for_everyone()
-                if accelerator.is_main_process:
-                    accelerator.save(accelerator.unwrap_model(first_model).state_dict(), first_model_path.format(args.prefix, args.dataset, epoch, 'end'))
-                    if not args.freeze_llama:
-                        accelerator.save(accelerator.unwrap_model(model).state_dict(), model_path.format(args.prefix, args.dataset, epoch, 'end'))
-            best_epoch = args.best_epoch
-     
-        accelerator.wait_for_everyone()
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.reset_max_memory_allocated()
-        accelerator.wait_for_everyone()
+    context_limit = model.config.max_position_embeddings
+    trainable, total = print_trainable_params(first_model, model)
+    accelerator.print(f'Trainable parameters: {trainable} / {total}')
+    # PyG graphs have a different leading dimension from the token batch. The
+    # entire collated graph batch must be moved, never split by Accelerator.
+    if first_model is None:
+        model, loader = accelerator.prepare(model, loader)
     else:
-        first_model, model, test_loader = accelerator.prepare(first_model, model, test_loader)
-        best_epoch = args.best_epoch
+        first_model, model, loader = accelerator.prepare(first_model, model, loader)
+    if args.inference:
+        evaluate(args, accelerator, first_model, model, loader, tokenizer)
+    else:
+        optimizer, scheduler = trainer.create_optimizer_and_scheduler(first_model, model, loader)
+        optimizer = accelerator.prepare(optimizer)
+        optimizer.zero_grad()
+        for epoch in range(args.epoch):
+            first_model.train()
+            # Checkpointing is active only in train mode; frozen parameters do
+            # not stop autograd from carrying the loss back to graph tokens.
+            model.train()
+            loss_sum, examples = 0., 0
+            for step, batch in enumerate(tqdm(loader, disable=not accelerator.is_main_process, desc=f'Epoch {epoch}')):
+                # Accelerate 0.20.3 accepts exactly one module in accumulate().
+                # It updates sync_gradients on entry; suppress LLM DDP sync as
+                # well when optional LoRA training accumulates several batches.
+                with accelerator.accumulate(first_model), (
+                    nullcontext() if accelerator.sync_gradients else accelerator.no_sync(model)
+                ):
+                    if batch['input_ids'].size(1) > context_limit:
+                        raise ValueError('Training sequence exceeds the base LLM context window')
+                    embeds = first_model(batch['input_ids'], batch['is_node'], batch['graph'])
+                    output = model(inputs_embeds=embeds, attention_mask=batch['attn_mask'],
+                                   labels=batch['target_ids'], use_cache=False)
+                    loss = output.loss
+                    if not torch.isfinite(loss):
+                        raise FloatingPointError('Non-finite training loss')
+                    # Accelerate divides by grad_steps. Correct the final partial
+                    # window so it has the same weight as a full accumulation.
+                    remainder = len(loader) % args.grad_steps
+                    in_tail = remainder and step >= len(loader) - remainder
+                    scaled_loss = loss * (args.grad_steps / remainder if in_tail else 1.)
+                    accelerator.backward(scaled_loss)
+                    if accelerator.sync_gradients:
+                        accelerator.clip_grad_norm_([p for g in optimizer.param_groups for p in g['params']],
+                                                    args.clip_grad_norm)
+                    optimizer.step()
+                    if accelerator.sync_gradients and not accelerator.optimizer_step_was_skipped:
+                        scheduler.step()
+                    optimizer.zero_grad()
+                batch_size = batch['input_ids'].size(0)
+                loss_sum += loss.detach().float().item() * batch_size
+                examples += batch_size
+            stats = torch.tensor([loss_sum, examples], device=accelerator.device)
+            stats = accelerator.reduce(stats, reduction='sum')
+            accelerator.print(f'Epoch {epoch}: loss={stats[0].item() / stats[1].item():.6f}')
+            if args.log_with:
+                accelerator.log({'epoch': epoch, 'loss': (stats[0] / stats[1]).item()})
+            save_models(args, accelerator, first_model, model, epoch)
+    # Accelerate 0.20.3 creates `trackers` only in init_trackers().
+    if args.log_with:
+        accelerator.end_training()
 
-        # Step 5. Evaluating
-        accelerator.print('Evaluating')
-        with accelerator.main_process_first():
-            first_model = accelerator.unwrap_model(first_model)
-            first_model.load_state_dict(torch.load(first_model_path.format(args.prefix, args.dataset, best_epoch, 'end')))
-            # first_model.GT.load_state_dict(torch.load(first_model_path.format(args.prefix, args.dataset, best_epoch, 'end')))
-            model = model.cuda() # transformers bug
-            model = accelerator.unwrap_model(model)
-            if not args.freeze_llama:
-                model.load_state_dict(torch.load(model_path.format(args.prefix, args.dataset, best_epoch, 'end')))
 
+def save_models(args, accelerator, first_model, model, epoch):
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        for kind, marker, module in [('first_model', 'fm', first_model), ('model', 'm', model)]:
+            if kind == 'model' and args.freeze_llama:
+                continue
+            folder = Path(args.save_dir) / kind
+            folder.mkdir(parents=True, exist_ok=True)
+            filename = folder / f'{args.prefix}_{marker}_{args.dataset}_epoch{epoch}_end.pth'
+            accelerator.save(accelerator.unwrap_model(module).state_dict(), filename)
+            accelerator.print(f'Saved {filename}')
+
+
+def evaluate(args, accelerator, first_model, model, loader, tokenizer):
+    # Loading/initializing the extra graph branch consumes RNG state. Start
+    # decoding from the recorded seed for both methods in the paired comparison.
+    seed_everything(args.run_seed)
+    if first_model is not None:
         first_model.eval()
-        model.eval()
-        samples_seen = 0
-        eval_output = []
-        eval_label = []
-
-        progress_bar_test = tqdm(range(len(test_loader)))
-        for step, batch in enumerate(test_loader):
+    model.eval()
+    generator = accelerator.unwrap_model(model)
+    decoding = generation_kwargs(max_new_tokens=args.gen_max_length, do_sample=args.do_sample,
+                                  temperature=args.temperature, top_p=args.top_p, top_k=args.top_k,
+                                  pad_token_id=tokenizer.pad_token_id)
+    settings = resolved_generation_settings(generator, decoding)
+    settings.update(model_dtype=str(next(generator.parameters()).dtype), cuda_runtime=torch.version.cuda,
+                    device=str(accelerator.device), num_processes=accelerator.num_processes,
+                    gpu=torch.cuda.get_device_name(accelerator.device) if accelerator.device.type == 'cuda' else None)
+    recorder = InferenceRecorder(args, loader.dataset, settings) if accelerator.is_main_process else None
+    try:
+        for batch in tqdm(loader, disable=not accelerator.is_main_process, desc=f'Evaluating {args.method}'):
             with torch.no_grad():
-                input_ids = batch['input_ids']
-                is_node = batch['is_node']
-                attention_mask = batch['attn_mask']
-                graph = batch['graph']
-
-                embeds = first_model(
-                    input_ids=input_ids,
-                    is_node=is_node,
-                    graph=graph
-                )
-
-                results = model.g_step(in_embeds=embeds, attention_mask=attention_mask)
+                if batch['input_ids'].size(1) + args.gen_max_length > generator.config.max_position_embeddings:
+                    raise ValueError('Prompt plus --gen_max_length exceeds the base LLM context window')
+                states = None
+                if first_model is None:
+                    embeds = generator.get_input_embeddings()(batch['input_ids'])
+                elif args.save_features:
+                    embeds, states = first_model(batch['input_ids'], batch['is_node'], batch['graph'], return_features=True)
+                else:
+                    embeds = first_model(batch['input_ids'], batch['is_node'], batch['graph'])
+                # Both methods use inputs_embeds and the same decoding path.
+                results = generator.generate(generation_config=deepcopy(generator.generation_config),
+                                             inputs_embeds=embeds, attention_mask=batch['attn_mask'], **decoding)
                 results = accelerator.pad_across_processes(results, dim=1, pad_index=tokenizer.pad_token_id)
-                results_gathered = accelerator.gather(results).cpu().numpy()
+                inputs = accelerator.pad_across_processes(batch['input_ids'], dim=1, pad_index=tokenizer.pad_token_id)
+                masks = accelerator.pad_across_processes(batch['attn_mask'], dim=1, pad_index=0)
+                payload = (results, batch['sample_index'], inputs, masks)
+                if states is not None:
+                    payload += (states['H_GNN'], states['T_graph'])
+                gathered = accelerator.gather_for_metrics(payload)
+            if recorder is not None:
+                results, indices, inputs, masks = [t.detach().cpu() for t in gathered[:4]]
+                output_tokens = []
+                for row in results.tolist():
+                    # Keep BOS and EOS in token logs, dropping only post-EOS padding.
+                    if tokenizer.eos_token_id in row:
+                        row = row[:row.index(tokenizer.eos_token_id) + 1]
+                    output_tokens.append(row)
+                input_tokens = [row[mask.bool()].tolist() for row, mask in zip(inputs, masks)]
+                outputs = tokenizer.batch_decode(output_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
+                raw = tokenizer.batch_decode(output_tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                graph_features = dict(zip(('H_GNN', 'T_graph'), gathered[4:])) if states is not None else None
+                recorder.write_batch(indices.tolist(), outputs, raw, output_tokens, input_tokens, graph_features)
+        if recorder is not None:
+            if len(recorder.seen) != len(loader.dataset):
+                raise RuntimeError('Evaluation count differs from instruction count')
+            metrics = recorder.finish(True)
+            if metrics:
+                accelerator.print(f"Accuracy={metrics['accuracy']:.6f}, Macro F1={metrics['macro_f1']:.6f}, "
+                                  f"Valid answers={metrics['valid_answer_rate']:.6f}")
+            accelerator.print(f'Saved complete inference artifacts to {recorder.folder}')
+    except BaseException:
+        if recorder is not None:
+            failure = traceback.format_exc()
+            try:
+                recorder.finish(False, failure)
+            except Exception:
+                accelerator.print('Artifact finalization failed; flushed JSONL and feature_store files are retained.\n'
+                                  + traceback.format_exc())
+        raise
 
-                labels = accelerator.pad_across_processes(
-                    batch["target_ids"],
-                    dim=1,
-                    pad_index=tokenizer.pad_token_id)
-                labels_gathered = accelerator.gather(labels).cpu().numpy()
 
-                if accelerator.num_processes > 1:
-                    if step == len(test_loader) - 1:
-                        results_gathered = results_gathered[
-                                                    : len(test_loader.dataset) - samples_seen]
-                        labels_gathered = labels_gathered[
-                                                    : len(test_loader.dataset) - samples_seen]
-                    else:
-                        samples_seen += len(results_gathered)
-                labels_gathered = np.where(labels_gathered != -100, labels_gathered, tokenizer.pad_token_id)
-                accelerator.print(tokenizer.batch_decode(results_gathered, skip_special_tokens=True))
-                # accelerator.print(tokenizer.batch_decode(labels_gathered, skip_special_tokens=True))
-
-                eval_output.append(results_gathered)
-                eval_label.append(labels_gathered)
-            progress_bar_test.update(1)
-
-        # Step 6. Post-processing & Evaluating
-        res_path = f'./results/{args.test_dataset}/{args.prefix}_model_results.txt'
-        label_path = f'./results/{args.test_dataset}/{args.prefix}_model_labels.txt'
-
-        if not os.path.exists(f'./results/{args.test_dataset}'):
-            os.makedirs(f'./results/{args.test_dataset}')
-
-        if accelerator.is_local_main_process:
-            eval_pred, eval_decode_label = output_decode(eval_output, eval_label, tokenizer)
-            with open(res_path, 'w') as f:
-                json.dump(eval_pred, f)
-            with open(label_path, 'w') as f:
-                json.dump(eval_decode_label, f)
-    
-
-if __name__ == "__main__":
-
+if __name__ == '__main__':
     args = parse_args()
-    for exp, SEED in enumerate(range(args.exp_num)):
-        init_kwargs = InitProcessGroupKwargs(timeout=timedelta(seconds=7200))
-        ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
-        transformers.logging.set_verbosity_error()
-        accelerator = Accelerator(log_with="wandb", kwargs_handlers=[ddp_kwargs, init_kwargs],
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('--device cuda requested, but CUDA is unavailable')
+    for exp in range(args.exp_num):
+        run_args = deepcopy(args)
+        seed = args.seed + exp if args.seed != -1 else exp
+        if args.exp_num > 1:
+            run_args.prefix = f'{args.prefix}_seed{seed}'
+        accelerator = Accelerator(cpu=args.device == 'cpu', log_with=args.log_with,
+                                  split_batches=False, dispatch_batches=False,
+                                  kwargs_handlers=[DistributedDataParallelKwargs(find_unused_parameters=False, broadcast_buffers=False),
+                                                   InitProcessGroupKwargs(timeout=timedelta(seconds=7200))],
                                   gradient_accumulation_steps=args.grad_steps)
-        if args.seed != -1:
-            SEED = args.seed
-        main(args, SEED)
-        torch.cuda.empty_cache()
-        torch.cuda.reset_max_memory_allocated()
+        main(run_args, seed, accelerator)
+        accelerator.free_memory()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         gc.collect()

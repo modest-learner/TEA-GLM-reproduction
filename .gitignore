@@ -5,3 +5,8 @@
 /saved_model
 /wandb
 **/__pycache__/
+/.audit_deps/
+/.pytest_cache/
+/tmp/
+/.venv/
+/models/

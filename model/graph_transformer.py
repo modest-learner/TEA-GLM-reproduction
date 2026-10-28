@@ -12,28 +12,38 @@ class GraphEncoder(nn.Module):    # first_model, i.e. simple MLP for dimension t
         self.args = args
         self.GT = GraphSAGE(args)
 
-        self.embed_tokens = llama_embed   # freezed Llama-7b word embeddings.
+        self.register_buffer('embed_tokens', llama_embed.detach(), persistent=False)
         self.embed_dim = llama_embed.shape[1]
 
         self.graph_projector = nn.Sequential(
             nn.Linear(args.gnn_output, self.args.num_token * self.embed_dim),
             )
         
-        for m in self.modules():
-            if isinstance(m, nn.LayerNorm):
-                m.weight.data.fill_(1.0)
-            elif isinstance(m, nn.Linear):
-                m.weight.data.normal_(mean=0.0, std=1.0)
+    def train(self, mode=True):
+        super().train(mode)
+        if not any(p.requires_grad for p in self.GT.parameters()):
+            self.GT.eval()
+        return self
 
-    def forward(self, input_ids, is_node, graph):
-        batch_size = input_ids.shape[0]
-
-        node_embedding = self.graph_projector(self.GT(graph.x, graph.edge_index, graph.edge_attr, graph.batch, graph.lp))
+    def forward(self, input_ids, is_node, graph, return_features=False):
+        counts = is_node.sum(dim=1)
+        if not t.all(counts == self.args.num_token):
+            raise ValueError('Each sample must contain num_token graph placeholders')
+        dtype = next(self.GT.parameters()).dtype
+        gnn_features = self.GT(graph.x.to(dtype=dtype), graph.edge_index, graph.edge_attr, graph.batch, graph.lp)
+        node_embedding = self.graph_projector(gnn_features)
         node_embeddings = node_embedding.view(-1, self.embed_dim) # [bs * 5, dim]
 
-        inputs_embeds = self.embed_tokens[input_ids]
-        inputs_embeds[is_node] = node_embeddings
+        if node_embedding.shape[0] != input_ids.shape[0]:
+            raise ValueError('Graph batch and token batch sizes differ')
+        inputs_embeds = F.embedding(input_ids.masked_fill(is_node, 0), self.embed_tokens)
+        inputs_embeds[is_node] = node_embeddings.to(inputs_embeds.dtype)
 
+        if return_features:
+            # These are the exact states used in this forward pass, before
+            # injection into the LLM; no second GNN/projector evaluation.
+            return inputs_embeds, {'H_GNN': gnn_features,
+                                   'T_graph': node_embedding.view(-1, self.args.num_token, self.embed_dim)}
         return inputs_embeds # [bsz, seq, dim]
 
 

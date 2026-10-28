@@ -1,33 +1,11 @@
-#!/bin/bash
-export CUDA_VISIBLE_DEVICES=0,1
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
-wandb offline
-
-
-llm='/path/to/llm'
-seed=0
-num_token=5
-prefix='prefix of your first model to save'
-pretrain_gnn='model_file.pth'
-
-
-accelerate launch \
-    --config_file accelerate_config/my_config_0.yaml \
-    train_glm.py \
-        --freeze_llama \
-        --dataset computer \
-        --pretrain_gnn $pretrain_gnn \
-        --att_d_model 2048 \
-        --gnn_output 4096 \
-	    --grad_steps 1 \
-        --batch_size 2 \
-        --num_token $num_token \
-        --clip_grad_norm 1.0 \
-        --backbone $llm \
-        --epoch 1 \
-	    --weight_decay 0. \
-        --max_text_length 1000 \
-        --gen_max_length 64 \
-	    --lr 0.002 \
-        --prefix $prefix \
-        --seed $seed
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+LLM="${LLM:-${1:-}}"
+: "${LLM:?Usage: bash scripts/train_computer.sh /path/to/vicuna-7b-v1.5}"
+python train_glm.py --backbone "$LLM" --dataset computer --freeze_llama \
+  --pretrain_gnn GraphSAGE_computer_1000_tp.pth --num_token 5 \
+  --batch_size "${BATCH_SIZE:-2}" --grad_steps "${GRAD_STEPS:-2}" --epoch 1 \
+  --att_d_model 2048 --gnn_output 4096 --clip_grad_norm 1.0 --weight_decay 0.0 \
+  --max_text_length "${MAX_TEXT_LENGTH:-1000}" --lr "${LR:-0.001}" --optim "${OPTIM:-adam}" \
+  --dtype bfloat16 --seed "${SEED:-0}" --exp_num "${EXP_NUM:-1}" --prefix "${PREFIX:-tea-ecom}"

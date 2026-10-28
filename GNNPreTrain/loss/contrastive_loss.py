@@ -2,9 +2,20 @@ from torch import nn
 import torch
 import torch.nn.functional as F
 
+
+def contrastive_rows(z1, z2, tau, exclude_self):
+    # Accumulate logits in FP32 and use logsumexp to avoid exp overflow.
+    z1, z2 = F.normalize(z1.float(), dim=1), F.normalize(z2.float(), dim=1)
+    within, across = z1 @ z1.t() / tau, z1 @ z2.t() / tau
+    if exclude_self:
+        within = within.masked_fill(torch.eye(len(z1), dtype=torch.bool, device=z1.device), -torch.inf)
+    return torch.logsumexp(torch.cat([within, across], dim=1), dim=1) - across.diag()
+
 class ContrastiveLoss(nn.Module):
     def __init__(self, tau, self_tp=False) -> None:
         super().__init__()
+        if tau <= 0:
+            raise ValueError('tau must be positive')
         self.tau = tau
         self.self_tp = self_tp
         self.f = lambda x: torch.exp(x / self.tau)
@@ -16,38 +27,25 @@ class ContrastiveLoss(nn.Module):
     
     def instance_loss(self, proj_z1, proj_z2):
 
-        refl_sim = self.f(self.sim(proj_z1, proj_z1))
-        between_sim = self.f(self.sim(proj_z1, proj_z2))
-
-        loss = -torch.log(
-            between_sim.diag()
-            / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()))
-
-        return loss
+        return contrastive_rows(proj_z1, proj_z2, self.tau, exclude_self=True)
 
     def text_contrast(self, z1, z2, principal_component=None):
         if self.self_tp:
             z1, z2 = z1.unsqueeze(1), z2.unsqueeze(1)
-            matrix_1 = torch.bmm(z1, principal_component.permute(0, 2, 1)).squeeze().t()
-            matrix_2 = torch.bmm(z2, principal_component.permute(0, 2, 1)).squeeze().t()
+            matrix_1 = torch.bmm(z1, principal_component.permute(0, 2, 1)).squeeze(1).t()
+            matrix_2 = torch.bmm(z2, principal_component.permute(0, 2, 1)).squeeze(1).t()
         else:
             matrix_1 = torch.mm(z1, principal_component.t()).t()
             matrix_2 = torch.mm(z2, principal_component.t()).t()
     
-        refl_sim = self.f(self.sim(matrix_1, matrix_1))
-        between_sim = self.f(self.sim(matrix_1, matrix_2))
-
-        loss = -torch.log(
-            between_sim.diag()
-            / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag() - between_sim.diag()))
-
-        return loss
+        # Equation (6) includes both within-view and cross-view diagonals.
+        return contrastive_rows(matrix_1, matrix_2, self.tau, exclude_self=False)
 
     def get_loss(self, z1, z2, proj_z1, proj_z2, principal_component):
         instance_loss = self.instance_loss(proj_z1, proj_z2).mean()
         text_contrast = self.text_contrast(z1, z2, principal_component).mean()
 
-        return (instance_loss + text_contrast), instance_loss.data.item(), text_contrast.data.item()
+        return 0.5 * (instance_loss + text_contrast), instance_loss.item(), text_contrast.item()
 
     def forward(self, z1, z2, proj_z1, proj_z2, principal_component):
         l1, ins_loss_1, contrast_loss_1 = self.get_loss(z1, z2, proj_z1, proj_z2, principal_component)
@@ -63,6 +61,8 @@ class ContrastiveLoss(nn.Module):
 class GraceLoss(nn.Module):
     def __init__(self, tau) -> None:
         super().__init__()
+        if tau <= 0:
+            raise ValueError('tau must be positive')
         self.tau = tau
     
     def sim(self, proj_z1, proj_z2):
@@ -71,16 +71,7 @@ class GraceLoss(nn.Module):
         return torch.mm(z1, z2.t())
 
     def get_loss(self, proj_z1, proj_z2):
-        f = lambda x: torch.exp(x / self.tau)
-
-        refl_sim = f(self.sim(proj_z1, proj_z1))
-        between_sim = f(self.sim(proj_z1, proj_z2))
-
-        loss = -torch.log(
-            between_sim.diag()
-            / (refl_sim.sum(1) + between_sim.sum(1) - refl_sim.diag()))
-
-        return loss
+        return contrastive_rows(proj_z1, proj_z2, self.tau, exclude_self=True)
 
     def get_real_loss(self, proj_z1, proj_z2, batch):
         f = lambda x: torch.exp(x / self.tau)

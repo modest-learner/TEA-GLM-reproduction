@@ -129,8 +129,21 @@ def normalize_label(text):
     return text.strip(' \t\n\r\"\'`*.,:;!?[](){}')
 
 
+EVALUATION_VERSION = 'nc-unified-v1'
+
+
 class LabelResolver:
-    def __init__(self, classes):
+    """Extract a prediction WITHOUT consulting the ground-truth answer.
+
+    strict: the previous whole-answer matcher, retained for audit.
+    unique: accept exactly one candidate mentioned with word boundaries.
+    Conservative negation/uncertainty guards are not a semantic language model;
+    rejected answers are retained for inspection, never guessed from the target.
+    """
+    def __init__(self, classes, policy='unique'):
+        if policy not in ('strict', 'unique'):
+            raise ValueError('Unknown evaluation policy: ' + str(policy))
+        self.policy = policy
         self.classes = list(classes)
         if not self.classes or len(set(self.classes)) != len(self.classes):
             raise ValueError('Classes must be nonempty and unique')
@@ -151,8 +164,11 @@ class LabelResolver:
             if key.startswith(prefix):
                 aliases[key.removeprefix('artificial intelligence, ')].add(label)
         self.aliases = {alias: next(iter(labels)) for alias, labels in aliases.items() if len(labels) == 1}
+        # Full names and the already documented arXiv/Cora aliases only.
+        self.patterns = [(re.compile(r'(?<!\w)' + re.escape(name) + r'(?!\w)'), label)
+                         for name, label in {**self.aliases, **self.exact}.items()]
 
-    def resolve(self, response):
+    def resolve_strict(self, response):
         key = normalize_label(response)
         # Accept a simple answer prefix and surrounding formatting. Do not guess
         # based on substrings/fuzzy similarity or select among multiple labels.
@@ -160,35 +176,89 @@ class LabelResolver:
         key = normalize_label(key)
         return self.exact.get(key, self.aliases.get(key))
 
+    def resolve_detail(self, response):
+        if not isinstance(response, str):
+            raise ValueError('An LLM response must be a string')
+        strict = self.resolve_strict(response)
+        if strict is not None:
+            return dict(label=strict, reason='exact_or_alias', candidates=[strict])
+        if self.policy == 'strict':
+            return dict(label=None, reason='strict_unmatched', candidates=[])
+        text = normalize_label(response)
+        spans = [(match.start(), match.end(), label)
+                 for pattern, label in self.patterns for match in pattern.finditer(text)]
+        # A complete, more specific name wins over a name contained inside it;
+        # separate mentions of different categories still remain ambiguous.
+        spans = [(a, b, label) for a, b, label in spans if not any(
+            c <= a and b <= d and (c < a or b < d) for c, d, _ in spans)]
+        candidates = sorted({label for _, _, label in spans})
+        if len(candidates) != 1:
+            return dict(label=None, reason='multiple_candidates' if candidates else 'no_candidate',
+                        candidates=candidates)
+        # Reject uncertain or negative prose conservatively. This deliberately
+        # sacrifices some recall instead of crediting "not Type 1 diabetes".
+        negative = r"\b(?:not|no|never|neither|nor|cannot|can't|won't|without)\b|\b\w+n['\u2019]t\b"
+        uncertain = (r'\b(?:unclear|unknown|unsure|uncertain|insufficient|unable|'
+                     r'undetermined|ambiguous|whether|might|maybe|possibly|perhaps)\b|'
+                     r'\b(?:could|may)\s+be\b|\b(?:rather than|instead of)\b')
+        if re.search(negative, text):
+            reason = 'negation_or_exclusion'
+        elif re.search(uncertain, text):
+            reason = 'uncertain_answer'
+        else:
+            return dict(label=candidates[0], reason='unique_candidate', candidates=candidates)
+        return dict(label=None, reason=reason, candidates=candidates)
 
-def node_classification_metrics(predictions, references, classes):
+    def resolve(self, response):
+        return self.resolve_detail(response)['label']
+
+
+def _classification_counts(predicted, targets, classes):
+    support, selected = Counter(targets), Counter(p for p in predicted if p is not None)
+    correct = Counter(target for target, pred in zip(targets, predicted) if target == pred)
+    per_class = {}
+    for label in classes:
+        tp, fp, fn = correct[label], selected[label] - correct[label], support[label] - correct[label]
+        per_class[label] = dict(support=support[label], true_positive=tp, false_positive=fp, false_negative=fn,
+                                precision=tp / (tp + fp) if tp + fp else 0.,
+                                recall=tp / (tp + fn) if tp + fn else 0.,
+                                f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.)
+    return dict(accuracy=sum(correct.values()) / len(targets) if targets else None,
+                macro_f1=sum(row['f1'] for row in per_class.values()) / len(classes) if targets else None,
+                per_class=per_class)
+
+
+def node_classification_metrics(predictions, references, classes, policy='unique'):
     if not predictions or len(predictions) != len(references):
         raise ValueError('Predictions and references must have the same nonzero length')
-    resolver = LabelResolver(classes)
+    resolver = LabelResolver(classes, policy=policy)
     targets = []
     for reference in references:
         target = resolver.exact.get(normalize_label(reference))
         if target is None:
             raise ValueError(f'Unknown reference label: {reference}')
         targets.append(target)
-    predicted = [resolver.resolve(response) for response in predictions]
-    support, selected = Counter(targets), Counter(p for p in predicted if p is not None)
-    correct = Counter(target for target, pred in zip(targets, predicted) if target == pred)
-    per_class = {}
-    for label in resolver.classes:
-        tp, fp, fn = correct[label], selected[label] - correct[label], support[label] - correct[label]
-        per_class[label] = dict(support=support[label], true_positive=tp, false_positive=fp, false_negative=fn,
-                                precision=tp / (tp + fp) if tp + fp else 0.,
-                                recall=tp / (tp + fn) if tp + fn else 0.,
-                                f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.)
+    details = [resolver.resolve_detail(response) for response in predictions]
+    predicted = [d['label'] for d in details]
+    full = _classification_counts(predicted, targets, resolver.classes)
+    legal = [(p, y) for p, y in zip(predicted, targets) if p is not None]
+    legal_metrics = _classification_counts([p for p, _ in legal], [y for _, y in legal], resolver.classes)
+    strict = [resolver.resolve_strict(response) for response in predictions]
+    strict_metrics = _classification_counts(strict, targets, resolver.classes)
+    strict_metrics.pop('per_class')
+    strict_metrics['valid_answer_rate'] = sum(p is not None for p in strict) / len(targets)
     invalid = sum(label is None for label in predicted)
     report = dict(task='node_classification', num_samples=len(targets), num_classes=len(resolver.classes),
-                  accuracy=sum(correct.values()) / len(targets),
-                  macro_f1=sum(row['f1'] for row in per_class.values()) / len(per_class),
+                  **full, macro_f1_all=full['macro_f1'], macro_f1_legal=legal_metrics['macro_f1'],
+                  num_valid=len(legal), legal_per_class=legal_metrics['per_class'],
                   valid_answer_rate=1 - invalid / len(targets), invalid_answers=invalid,
-                  evaluation_policy='all_examples; invalid predictions count as errors; macro F1 over dataset classes; zero_division=0',
-                  label_mapping='normalized exact match; arXiv code/name aliases; released Cora ML hierarchy aliases; no fuzzy matching',
-                  per_class=per_class)
+                  evaluation_version=EVALUATION_VERSION, parser_policy=policy,
+                  evaluation_policy='Accuracy and macro_f1/macro_f1_all: all examples, invalid=error/FN; '
+                                    'macro_f1_legal: valid examples only; all dataset classes; zero_division=0; '
+                                    'no legal examples => macro_f1_legal=null',
+                  label_mapping='normalized exact/alias' if policy == 'strict' else
+                                'exact/alias then unique boundary-matched candidate; conservative negation/uncertainty guards',
+                  resolution_counts=dict(Counter(d['reason'] for d in details)), strict_metrics=strict_metrics)
     return report, predicted
 
 
@@ -283,6 +353,7 @@ class FeatureStore:
         self.written[indices] = True
         self.written.flush()
         self.manifest['num_saved'] = int(self.written.sum())
+        atomic_json(self.folder / 'manifest.json', self.manifest)
 
     def close(self, complete):
         self.manifest['complete'] = bool(complete)
@@ -296,6 +367,12 @@ def recover_features(run_dir):
     import numpy as np
     import torch
     run_dir = Path(run_dir)
+    # A stale partial feature_store must never replace a complete final tensor
+    # package (e.g. after copying files from the server at different times).
+    existing = list(run_dir.glob('features_*.pt'))
+    if existing:
+        raise FileExistsError(f'Final feature file already exists: {existing[0]}; '
+                              'recovery is only for runs without a final feature file')
     folder = run_dir / 'feature_store'
     manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
     written = np.load(folder / 'written.npy', mmap_mode='r')
@@ -344,7 +421,8 @@ class InferenceRecorder:
         self.predictions = [None] * len(dataset)
         self.seen = set()
         self.nc = set(dataset.instructions['task']) == {'nc'}
-        self.resolver = LabelResolver(dataset.class_labels if self.nc else sorted(set(self.references)))
+        self.resolver = LabelResolver(dataset.class_labels if self.nc else sorted(set(self.references)),
+                                      policy=getattr(args, 'evaluation_policy', 'unique') if self.nc else 'strict')
         self.settings = dict(decoding_settings)
         self.settings.update(seed=args.run_seed, backbone=args.backbone, source_dataset=args.dataset,
                              test_dataset=args.test_dataset, method=args.method, batch_size=args.batch_size,
@@ -366,6 +444,7 @@ class InferenceRecorder:
             instruction_file=file_fingerprint(dataset.instruction_path),
             projector_checkpoint=file_fingerprint(checkpoint) if checkpoint else None,
             source_files={str(p.relative_to(root)): file_fingerprint(p)['sha256'] for p in source_files},
+            evaluation_version=EVALUATION_VERSION, parser_policy=self.resolver.policy,
             text_baseline_definition='Same instruction preprocessing; remove <Node N> placeholders only; no GNN/projector',
             feature_note='X is the released node feature matrix, not LLM hidden states; H_GNN/T_graph do not exist for vicuna_text')
         atomic_json(self.folder / 'run_config.json', self.run_config)
@@ -383,11 +462,14 @@ class InferenceRecorder:
         for i, output, raw, generated, inputs in zip(indices, outputs, raw_outputs, output_tokens, input_tokens):
             row = self.dataset.instructions.iloc[i]
             node_id = int(row['node_set'][0])
-            parsed = self.resolver.resolve(output)
+            resolution = self.resolver.resolve_detail(output)
+            parsed = resolution['label']
             target = self.resolver.exact[normalize_label(row['output'])]
             records.append(dict(sample_index=i, node_id=node_id, true_label=row['output'],
                 llm_raw_output=output, parsed_pred=parsed, is_correct=parsed == target,
                 valid_answer=parsed is not None, llm_output_with_special_tokens=raw,
+                parse_reason=resolution['reason'], mentioned_candidates=resolution['candidates'],
+                evaluation_version=EVALUATION_VERSION, parser_policy=self.resolver.policy,
                 generated_token_ids=generated, input_token_ids=inputs, prompt=self.dataset.prompt_text(i),
                 target_node_ids=[int(n) for n in row['node_set'][:2 if row['task'] == 'lp' else 1]],
                 dataset=self.args.test_dataset, source_dataset=self.args.dataset, method=self.args.method,
@@ -411,6 +493,8 @@ class InferenceRecorder:
             self.predictions[i] = output
             self.seen.add(i)
         atomic_json(self.folder / 'progress.json', dict(num_completed=len(self.seen), num_expected=len(self.dataset)))
+        self.run_config['num_completed'] = len(self.seen)
+        atomic_json(self.folder / 'run_config.json', self.run_config)
         if self.args.verbose:
             from tqdm import tqdm
             for record in records:
@@ -440,7 +524,8 @@ class InferenceRecorder:
         atomic_json(self.parent / f'{self.args.prefix}_generation_config.json', self.settings)
         metrics = None
         if self.nc:
-            metrics, mapped = node_classification_metrics(self.predictions, self.references, self.dataset.class_labels)
+            metrics, mapped = node_classification_metrics(self.predictions, self.references, self.dataset.class_labels,
+                                                           policy=self.resolver.policy)
             atomic_json(self.folder / 'metrics.json', metrics)
             atomic_json(self.parent / f'{self.args.prefix}_metrics.json', metrics)
             atomic_json(self.parent / f'{self.args.prefix}_predicted_labels.json', mapped)
@@ -488,28 +573,107 @@ def read_predictions(path, instruction_path, references):
     return predictions
 
 
+def evaluate_saved_predictions(prediction_path, instruction_path, output, *, policy='unique',
+                               max_samples=None, parsed_output=None):
+    """CPU-only scoring; preserve raw run files and record input fingerprints."""
+    output = Path(output)
+    parsed_output = Path(parsed_output) if parsed_output else None
+    if parsed_output is not None and output.resolve() == parsed_output.resolve():
+        raise ValueError('Metric JSON and per-node JSONL must have different paths')
+    for path in (output, parsed_output):
+        if path is not None and path.exists():
+            raise FileExistsError(f'Refusing to overwrite {path}; choose a new output path')
+    references, classes = load_nc_references(instruction_path, max_samples)
+    predictions = read_predictions(prediction_path, instruction_path, references)
+    metrics, mapped = node_classification_metrics(predictions, references, classes, policy=policy)
+    metrics['inputs'] = dict(predictions=file_fingerprint(prediction_path),
+                            instructions=file_fingerprint(instruction_path))
+    metrics['evaluator_sha256'] = file_fingerprint(__file__)['sha256']
+    if parsed_output:
+        data = json.loads(Path(instruction_path).read_text(encoding='utf-8'))
+        if isinstance(data, list):
+            nodes = [row['node_set'][0] for row in data]
+        elif isinstance(data['node_set'], dict):
+            nodes = [data['node_set'][key][0] for key in data.get('prompt', data['node_set'])]
+        else:
+            nodes = [values[0] for values in data['node_set']]
+        resolver = LabelResolver(classes, policy)
+        parsed_output.parent.mkdir(parents=True, exist_ok=True)
+        with parsed_output.open('x', encoding='utf-8') as handle:
+            for i, (raw, target, pred) in enumerate(zip(predictions, references, mapped)):
+                detail = resolver.resolve_detail(raw)
+                handle.write(json.dumps(dict(sample_index=i, node_id=int(nodes[i]), true_label=target,
+                    llm_raw_output=raw, parsed_pred=pred, is_correct=pred == target,
+                    valid_answer=pred is not None, parse_reason=detail['reason'],
+                    mentioned_candidates=detail['candidates'], parser_policy=policy,
+                    evaluation_version=EVALUATION_VERSION), ensure_ascii=False) + '\n')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(output, metrics)
+    return metrics
+
+
 def _evaluation_main():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('--predictions', type=Path, help='The *_model_results.txt JSON array or predictions_*.jsonl')
     parser.add_argument('--instructions', type=Path, help='The matching *_dataset_test.json')
     parser.add_argument('--max_samples', type=int, default=None, help='Use the same value as the generation command')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--policy', choices=['unique', 'strict'], default='unique')
+    parser.add_argument('--parsed-output', type=Path, help='New per-node audit JSONL; original logs are not changed')
+    parser.add_argument('--results-root', type=Path, help='Score all complete legacy output arrays under this experiment')
+    parser.add_argument('--instruction-dir', type=Path, default=Path(__file__).resolve().parents[1] / 'instruction')
+    parser.add_argument('--datasets', nargs='+', default=['pubmed', 'history', 'children', 'sports'])
+    parser.add_argument('--output-dir', type=Path, help='New directory for batch evaluation; refuses overwrite')
     parser.add_argument('--recover-features', type=Path, help='Finalize a retained feature_store in this run directory on CPU')
     args = parser.parse_args()
     if args.recover_features:
         print(f'Saved {recover_features(args.recover_features)}')
         return
+    if args.results_root:
+        if not args.output_dir or args.output_dir.exists():
+            parser.error('--output-dir must name a new directory for batch evaluation')
+        if any((args.predictions, args.instructions, args.output, args.parsed_output, args.max_samples)):
+            parser.error('Do not combine batch evaluation with single-file/subset options')
+        summary = []
+        for dataset in args.datasets:
+            instruction = args.instruction_dir / dataset / f'{dataset}_dataset_test.json'
+            for prediction in sorted((args.results_root / dataset).glob('*_model_results.txt')):
+                prefix = prediction.name.removesuffix('_model_results.txt')
+                destination = args.output_dir / dataset / prefix
+                try:
+                    references, _ = load_nc_references(instruction)
+                    labels_path = prediction.with_name(prefix + '_model_labels.txt')
+                    if json.loads(labels_path.read_text(encoding='utf-8')) != references:
+                        raise ValueError('Saved labels do not match the complete instruction order')
+                    config_path = prediction.parent / prefix / 'run_config.json'
+                    if config_path.exists():
+                        config = json.loads(config_path.read_text(encoding='utf-8'))
+                        expected_hash = config.get('instruction_file', {}).get('sha256')
+                        if expected_hash and file_fingerprint(instruction)['sha256'] != expected_hash:
+                            raise ValueError('Instruction hash differs from the generation run')
+                    metrics = evaluate_saved_predictions(prediction, instruction, destination / 'metrics.json',
+                        policy=args.policy, parsed_output=destination / 'predictions_evaluated.jsonl')
+                    row = dict(dataset=dataset, run=prefix, **{k: metrics[k] for k in
+                        ('num_samples', 'accuracy', 'macro_f1_all', 'macro_f1_legal', 'valid_answer_rate', 'strict_metrics')})
+                    summary.append(row)
+                    print(json.dumps(row, ensure_ascii=False))
+                except (ValueError, FileNotFoundError) as exc:
+                    parser.error(f'{dataset}/{prefix}: {exc}')
+        if not summary:
+            parser.error('No complete *_model_results.txt outputs found')
+        atomic_json(args.output_dir / 'summary.json', dict(evaluation_version=EVALUATION_VERSION,
+            parser_policy=args.policy, evaluator_sha256=file_fingerprint(__file__)['sha256'], runs=summary,
+            note='Scored complete raw output/label arrays; this does not certify completeness of separate logs or feature stores'))
+        return
     if not all((args.predictions, args.instructions, args.output)):
         parser.error('--predictions, --instructions and --output are required for scoring')
     try:
-        references, classes = load_nc_references(args.instructions, args.max_samples)
-        predictions = read_predictions(args.predictions, args.instructions, references)
-        metrics, _ = node_classification_metrics(predictions, references, classes)
-    except ValueError as exc:
+        metrics = evaluate_saved_predictions(args.predictions, args.instructions, args.output,
+            policy=args.policy, max_samples=args.max_samples, parsed_output=args.parsed_output)
+    except (ValueError, FileExistsError) as exc:
         parser.error(str(exc))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')
     print(f"Accuracy={metrics['accuracy']:.6f}, Macro F1={metrics['macro_f1']:.6f}, "
+          f"Macro F1 (legal)={metrics['macro_f1_legal']}, "
           f"Valid answers={metrics['valid_answer_rate']:.6f}; saved {args.output}")
 
 

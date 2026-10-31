@@ -172,6 +172,7 @@ def evaluate(args, accelerator, first_model, model, loader, tokenizer):
             metrics = recorder.finish(True)
             if metrics:
                 accelerator.print(f"Accuracy={metrics['accuracy']:.6f}, Macro F1={metrics['macro_f1']:.6f}, "
+                                  f"Macro F1 (legal)={metrics['macro_f1_legal']}, "
                                   f"Valid answers={metrics['valid_answer_rate']:.6f}")
             accelerator.print(f'Saved complete inference artifacts to {recorder.folder}')
     except BaseException:

@@ -18,6 +18,13 @@ class GraphEncoder(nn.Module):    # first_model, i.e. simple MLP for dimension t
         self.graph_projector = nn.Sequential(
             nn.Linear(args.gnn_output, self.args.num_token * self.embed_dim),
             )
+        # Preserve the released initialization for stage-2 training. Loading
+        # the full author checkpoint overwrites these weights at inference.
+        for module in self.modules():
+            if isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+            elif isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0., std=1.)
         
     def train(self, mode=True):
         super().train(mode)

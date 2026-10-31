@@ -93,9 +93,9 @@ saved_model/first_model/TEA-GLM_ecom.pth
 
 GitHub 的 projector 脚本则写了学习率 0.002、每卡 batch size 2、累积 1 步，结合原 config.py，优化器为 AdamW。**论文描述与脚本并非完全一致。** 当前训练脚本默认采用论文的 Adam、0.001、1 epoch。GNN 保持 `128 -> 2048 -> 4096`、2 层、5 个图 token、线性 projector。LLM 与 GNN 冻结，只训练 projector；采用作者代码中的 BF16。
 
-单张 24GB GPU 上训练默认 batch size 2、累积 2 步，有效 batch size 4，对应论文双卡每卡 2 的全局 batch。梯度检查点使用旧版接口，可用 `--no-gradient_checkpointing` 关闭。单卡累积与双卡计算不逐位等价；24GB 显存占用仍需服务器实测。
+单张 4090 上默认 batch size 2、累积 2 步，有效 batch size 4，对应论文双卡每卡 2 的全局 batch。梯度检查点使用旧版接口，可用 `--no-gradient_checkpointing` 关闭。单卡累积与双卡计算不逐位等价；24GB 显存占用仍需服务器实测。
 
-原 GitHub 长度：训练 arxiv 700、computer 1000；测试 arxiv/pubmed 700、cora 850、children/computer/photo 1000、history 1300、sports 500。当前仅将测试 Children 上限修正为 1100：对本地全部指令使用官方 Vicuna tokenizer、Transformers 4.28.0 实测，148 条超过 1000，最长 1035。其他长度保持原值。超长样本会明确报错，不截掉图 token 或答案；`MAX_TEXT_LENGTH` 可显式覆盖整组脚本的上限，须保留配置记录。
+原 GitHub 长度恢复到脚本中：训练 arxiv 700、computer 1000；测试 arxiv/pubmed 700、cora 850、children/computer/photo 1000、history 1300、sports 500。若样本超长，代码会明确报错，避免截掉图 token 或答案；`MAX_TEXT_LENGTH=2048` 可显式提高上限，但须记录为偏离原脚本长度设置。
 
 ## 4. 使用作者权重进行跨数据集节点分类
 
@@ -130,122 +130,6 @@ python utils/utils.py \
 ```
 
 仅生成前 N 条时，离线评分也需 `--max_samples N`。
-
-### 4.1 四个目标数据集：纯文本 Vicuna 与 TEA-GLM 配对对照
-
-`--method vicuna_text` 是同一份 TEA-GLM 指令经相同预处理后，仅移除 `<Node N>` 图占位符；不改写其余措辞、候选类别、Vicuna 系统模板。引用网络两组都沿用标题输入，电商两组都保留原指令提供的信息。纯文本分支不实例化 GNN/projector、不注入图向量，也不加载微调 LLM/LoRA；读取 graph.x 仅用于保存诊断所需的 X。`--method tea_glm` 使用作者完整 GNN/projector 权重。
-
-下面八次运行采用同一基座、BF16、batch size 1、种子 0，采样温度 0.7、最多生成 80 token；top_p 沿用官方基座的 0.6。每次开始推理时重新设置记录的随机种子，避免额外图模块的初始化消耗随机数影响两组的起点。batch size 1 是针对当前单张 3090 的明确调整，原推理脚本为 4；推理没有梯度更新，不需要梯度累积。相同种子不保证两组逐步采样相同，也不保证不同硬件逐位一致。
-
-| 目标 | 来源 / TEA-GLM 权重 | 测试节点数 | 实测最长输入 token | 本次长度上限 |
-| --- | --- | ---: | ---: | ---: |
-| pubmed | arxiv / citation | 3944 | 227 | 700 |
-| history | computer / ecom | 7546 | 1252 | 1300 |
-| children | computer / ecom | 14610 | 1035 | 1100 |
-| sports | computer / ecom | 34611 | 405 | 500 |
-
-最长长度基于本地发布指令、五个图 token 和旧版 tokenizer 的完整 TEA-GLM 输入。Children 的 1100 是防止全量实验中断的修正，不能称为作者原脚本的 1000；两种方法使用相同上限，动态 padding，不补齐到该上限。八条命令均不设置 `--max_samples`，运行全部测试节点。
-
-在服务器项目根目录执行。`LLM` 必须指向直接包含 `config.json` 和模型分片的目录；若权重放在 `models/vicuna-7b-v1.5`，只修改这一行。先上传本次修改后的代码。
-
-```bash
-conda activate teaglm
-cd ~/autodl-tmp/TEA-GLM
-export LLM="$PWD/models"
-export RESULTS_DIR="$PWD/results/comparison_$(date +%Y%m%d_%H%M%S)"
-export BATCH_SIZE=1 SEED=0 EXP_NUM=1
-echo "Results: $RESULTS_DIR"
-
-# 正向对照：arxiv -> PubMed
-METHOD=vicuna_text bash scripts/test_single.sh arxiv pubmed 5 700 \
-  "vicuna_text_seed${SEED}" "$LLM"
-METHOD=tea_glm bash scripts/test_single.sh arxiv pubmed 5 700 \
-  "tea_glm_seed${SEED}" "$LLM" saved_model/first_model/TEA-GLM_citation.pth
-
-# 正向对照：computer -> History
-METHOD=vicuna_text bash scripts/test_single.sh computer history 5 1300 \
-  "vicuna_text_seed${SEED}" "$LLM"
-METHOD=tea_glm bash scripts/test_single.sh computer history 5 1300 \
-  "tea_glm_seed${SEED}" "$LLM" saved_model/first_model/TEA-GLM_ecom.pth
-
-# 诊断：computer -> Children
-METHOD=vicuna_text bash scripts/test_single.sh computer children 5 1100 \
-  "vicuna_text_seed${SEED}" "$LLM"
-METHOD=tea_glm bash scripts/test_single.sh computer children 5 1100 \
-  "tea_glm_seed${SEED}" "$LLM" saved_model/first_model/TEA-GLM_ecom.pth
-
-# 诊断：computer -> Sports
-METHOD=vicuna_text bash scripts/test_single.sh computer sports 5 500 \
-  "vicuna_text_seed${SEED}" "$LLM"
-METHOD=tea_glm bash scripts/test_single.sh computer sports 5 500 \
-  "tea_glm_seed${SEED}" "$LLM" saved_model/first_model/TEA-GLM_ecom.pth
-```
-
-脚本强制启用 `--save_features --verbose`，通过 `python -u ... 2>&1 | tee` 保存全部 stdout/stderr，`pipefail` 保留失败退出码。已有运行目录或同名日志会拒绝覆盖；重跑失败实验请更换 `RESULTS_DIR` 或 prefix。重新登录服务器后，离线评测应将 `RESULTS_DIR` 设回已运行的实际目录，不要重新生成时间戳。
-
-每次完成后自动评测。八组结果可再次离线评分，无需加载模型或使用 GPU：
-
-```bash
-for target in pubmed history children sports; do
-  for method in vicuna_text tea_glm; do
-    run_dir="$RESULTS_DIR/$target/${method}_seed${SEED}"
-    python utils/utils.py \
-      --predictions "$run_dir/predictions_${target}.jsonl" \
-      --instructions "instruction/$target/${target}_dataset_test.json" \
-      --output "$run_dir/metrics_recomputed.json" || break 2
-  done
-done
-```
-
-评测会重新解析原始回答、核对 sample_index/node_id/true_label，并拒绝将不完整预测当成全量实验。指标包括 Accuracy、Macro F1、合法回答率及每类 precision/recall/F1、TP/FP/FN/support；非法回答不丢弃。下面打印对照表：
-
-```bash
-python - <<'PY'
-import json, os
-from pathlib import Path
-root, seed = Path(os.environ['RESULTS_DIR']), os.environ['SEED']
-print('dataset,method,n,accuracy,macro_f1,valid_answer_rate')
-for target in ('pubmed', 'history', 'children', 'sports'):
-    for method in ('vicuna_text', 'tea_glm'):
-        path = root / target / f'{method}_seed{seed}' / 'metrics_recomputed.json'
-        m = json.loads(path.read_text(encoding='utf-8'))
-        print(f"{target},{method},{m['num_samples']},{m['accuracy']:.6f},"
-              f"{m['macro_f1']:.6f},{m['valid_answer_rate']:.6f}")
-PY
-```
-
-这是一对固定作者权重、推理种子 0 的对照实验，不等同于论文五次独立训练的均值和标准差。如需观察采样波动，将 `SEED` 依次设为 1、2、3、4 并分别重跑八条命令；prefix 已包含种子。不要在这组命令中把 `EXP_NUM` 改成 5，否则输出路径规则不同。Sports 在所附表中相对 Vicuna 的 Accuracy 和 Macro F1 均提高，诊断时不预设它必然存在负迁移。
-
-### 4.2 必须保留的阶段 3 文件
-
-以 `tea_glm_seed0` 的 PubMed 为例：
-
-```text
-$RESULTS_DIR/
-  logs/tea_glm_seed0_arxiv_to_pubmed.log
-  pubmed/tea_glm_seed0/
-    predictions_pubmed.jsonl
-    features_pubmed.pt
-    feature_store/          # 逐批提交的恢复缓存，保留整个目录
-    run_config.json
-    generation_config.json
-    progress.json
-    metrics.json
-```
-
-- JSONL 每行包括要求的 `node_id, true_label, llm_raw_output, parsed_pred, is_correct`，并保存 `sample_index`、实际 prompt、输入/生成 token IDs、包含特殊符号的原始解码、合法回答标记、方法与种子。node_id 来自 `node_set[0]`，不是测试集行号。`llm_raw_output` 是去除特殊 token 后、未做标签解析的生成文本；另一个字段保留带特殊 token 的解码。
-- `features_*.pt` 包含 `X, H_GNN, T_graph, node_ids, sample_indices, true_labels, metadata`，按 sample_index 对齐。X 为作者发布 graph.x 的目标节点特征（128 维），不是重新编码的原始文本或 4096 维 LLM 隐状态。TEA-GLM 的 H_GNN 为 `[N,4096]`，T_graph 为 `[N,5,4096]`，直接来自本次推理的同一次前向；按实际 dtype 无损保存到 CPU。纯文本基线保存 X，H_GNN/T_graph 明确为 `None`。
-- `run_config.json` 记录状态、样本数、运行参数、实际解码设置、依赖版本、硬件、指令与 projector 的 SHA256，以及源码 SHA256；只有全部文件完成后状态才为 `complete`。正常异常保存 `error.txt` 和已完成的部分特征。原有 `_model_results.txt` 等兼容输出仍保留。
-- 每批先刷写特征、再刷写 JSONL，最后提交有效行标记。异常或强制终止后，只使用已提交行；缓存中未提交的预分配空间不能算作有效样本。四个数据集 TEA-GLM 的 BF16 特征本体约 2.8 GiB，连同恢复缓存约 5.6 GiB；再加基线 X 和日志，每个种子建议预留至少 8 GB 输出空间。
-
-正常结束自动生成 `.pt`。若进程被强制终止而未完成最终打包，在原推理进程退出后，可只用 CPU 从缓存恢复：
-
-```bash
-CUDA_VISIBLE_DEVICES="" python utils/utils.py --recover-features \
-  "$RESULTS_DIR/pubmed/tea_glm_seed${SEED}"
-```
-
-恢复结果的 `metadata.complete`、`metadata.num_saved` 和 `sample_indices` 标明是否完整及实际有效行。该命令只恢复特征，不恢复推理、不伪造缺失预测。后续 CPU 分析用 `torch.load(path, map_location='cpu')`，计算 SVD 等统计前可将 BF16 特征 `.float()`。
 
 ## 5. 重新训练与五个随机种子
 
@@ -310,9 +194,7 @@ bash scripts/test_single.sh arxiv cora_LP 5 2048 tea-citation-lp models/vicuna-7
 
 此前新版环境的测试不能作为旧版兼容性证明。本轮在独立 Python 3.9.23 / PyTorch 1.13.1 CPU / Transformers 4.28.0 / Accelerate 0.20.3 环境完成 9 项回归检查，失败项修复后复测通过：版本与 Python 3.9 语法、梯度检查点反传、NC/LP 数据与 padding、小模型实际 CLI 两轮训练及保存重载/NC/LP 生成/独立评测、解码参数、GNN 采样训练、sklearn PCA、指标对照、两套作者权重严格加载和 8 个数据集 NC/LP 共 16 种真实子图前向。pip check 与五个脚本的 bash -n 均通过。测试依赖和测试文件仅置于系统临时目录，不改变项目文件清单，也不修改已有 conda 环境。
 
-本次新增对照与诊断导出，在同一旧版依赖的临时 CPU 环境完成 8 项回归检查：纯文本只移除占位符且不创建 GNN；两组真实小模型 CLI 推理及逐节点/前向特征对齐；不导入 ML 包的离线评分和错位检测；拒绝覆盖；中断后恢复；BF16 位级无损及乱序行恢复；子集评估保留全类别；原训练梯度仍到达 projector。另用官方 Vicuna tokenizer 扫描上述四个数据集全部 60711 条指令，确认命令中的长度上限足够。
-
-3090 / CUDA 11.7 / 完整 Vicuna-7B 全量实验仍需服务器执行。依赖一致不构成论文数值一致的保证。
+4090 / CUDA 11.7 / 完整 Vicuna-7B 全量实验仍需服务器执行。依赖一致不构成论文数值一致的保证。
 
 ## Acknowledgements
 

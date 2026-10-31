@@ -69,6 +69,8 @@ def parse_args(parse=True, **optional_kwargs):
     parser.add_argument('--save_features', action='store_true',
                         help='Persist X and, for TEA-GLM, H_GNN/T_graph for CPU diagnostics')
     parser.add_argument('--verbose', action='store_true', help='Print each prediction in addition to the durable JSONL log')
+    parser.add_argument('--evaluation_policy', choices=['unique', 'strict'], default='unique',
+                        help='Versioned answer extraction; does not change prompts or generation')
     parser.add_argument('--gen_max_length', type=int, default=80)
     parser.add_argument('--do_sample', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--temperature', type=float, default=0.7)

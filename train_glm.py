@@ -19,6 +19,8 @@ from utils.utils import seed_everything, print_trainable_params, InferenceRecord
 
 
 def main(args, seed, accelerator):
+    if (args.graph_intervention != 'none' or args.graph_token_scale != 1.) and accelerator.num_processes != 1:
+        raise ValueError('Diagnostic interventions currently require a single process/GPU')
     if args.inference:
         output_parent = Path(args.results_dir) / args.test_dataset
         if ((output_parent / args.prefix).exists() or
@@ -140,7 +142,8 @@ def evaluate(args, accelerator, first_model, model, loader, tokenizer):
                 if first_model is None:
                     embeds = generator.get_input_embeddings()(batch['input_ids'])
                 elif args.save_features:
-                    embeds, states = first_model(batch['input_ids'], batch['is_node'], batch['graph'], return_features=True)
+                    embeds, states = first_model(batch['input_ids'], batch['is_node'], batch['graph'],
+                                                 return_features=True, source_graph=batch.get('source_graph'))
                 else:
                     embeds = first_model(batch['input_ids'], batch['is_node'], batch['graph'])
                 # Both methods use inputs_embeds and the same decoding path.
@@ -151,7 +154,8 @@ def evaluate(args, accelerator, first_model, model, loader, tokenizer):
                 masks = accelerator.pad_across_processes(batch['attn_mask'], dim=1, pad_index=0)
                 payload = (results, batch['sample_index'], inputs, masks)
                 if states is not None:
-                    payload += (states['H_GNN'], states['T_graph'])
+                    feature_names = sorted(states)
+                    payload += tuple(states[name] for name in feature_names)
                 gathered = accelerator.gather_for_metrics(payload)
             if recorder is not None:
                 results, indices, inputs, masks = [t.detach().cpu() for t in gathered[:4]]
@@ -164,7 +168,7 @@ def evaluate(args, accelerator, first_model, model, loader, tokenizer):
                 input_tokens = [row[mask.bool()].tolist() for row, mask in zip(inputs, masks)]
                 outputs = tokenizer.batch_decode(output_tokens, skip_special_tokens=True, clean_up_tokenization_spaces=False)
                 raw = tokenizer.batch_decode(output_tokens, skip_special_tokens=False, clean_up_tokenization_spaces=False)
-                graph_features = dict(zip(('H_GNN', 'T_graph'), gathered[4:])) if states is not None else None
+                graph_features = dict(zip(feature_names, gathered[4:])) if states is not None else None
                 recorder.write_batch(indices.tolist(), outputs, raw, output_tokens, input_tokens, graph_features)
         if recorder is not None:
             if len(recorder.seen) != len(loader.dataset):
@@ -172,6 +176,7 @@ def evaluate(args, accelerator, first_model, model, loader, tokenizer):
             metrics = recorder.finish(True)
             if metrics:
                 accelerator.print(f"Accuracy={metrics['accuracy']:.6f}, Macro F1={metrics['macro_f1']:.6f}, "
+                                  f"Macro F1 (legal)={metrics['macro_f1_legal']}, "
                                   f"Valid answers={metrics['valid_answer_rate']:.6f}")
             accelerator.print(f'Saved complete inference artifacts to {recorder.folder}')
     except BaseException:

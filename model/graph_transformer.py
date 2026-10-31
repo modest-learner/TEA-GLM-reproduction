@@ -18,6 +18,13 @@ class GraphEncoder(nn.Module):    # first_model, i.e. simple MLP for dimension t
         self.graph_projector = nn.Sequential(
             nn.Linear(args.gnn_output, self.args.num_token * self.embed_dim),
             )
+        # Preserve the released initialization for stage-2 training. Loading
+        # the full author checkpoint overwrites these weights at inference.
+        for module in self.modules():
+            if isinstance(module, nn.LayerNorm):
+                nn.init.ones_(module.weight)
+            elif isinstance(module, nn.Linear):
+                nn.init.normal_(module.weight, mean=0., std=1.)
         
     def train(self, mode=True):
         super().train(mode)
@@ -25,25 +32,51 @@ class GraphEncoder(nn.Module):    # first_model, i.e. simple MLP for dimension t
             self.GT.eval()
         return self
 
-    def forward(self, input_ids, is_node, graph, return_features=False):
+    def forward(self, input_ids, is_node, graph, return_features=False, source_graph=None):
         counts = is_node.sum(dim=1)
         if not t.all(counts == self.args.num_token):
             raise ValueError('Each sample must contain num_token graph placeholders')
         dtype = next(self.GT.parameters()).dtype
-        gnn_features = self.GT(graph.x.to(dtype=dtype), graph.edge_index, graph.edge_attr, graph.batch, graph.lp)
+        intervention = getattr(self.args, 'graph_intervention', 'none')
+        scale = getattr(self.args, 'graph_token_scale', 1.0)
+        if (intervention != 'none' or scale != 1.) and (self.training or not self.args.inference):
+            raise ValueError('Graph interventions are inference-only')
+        # Empty edges disable neighbour messages at EVERY layer. Do not add
+        # identity edges: GraphSAGE already has a separate root transformation.
+        edges = graph.edge_index[:, :0] if intervention == 'self_only' else graph.edge_index
+        gnn_features = self.GT(graph.x.to(dtype=dtype), edges, None if intervention == 'self_only' else graph.edge_attr,
+                               graph.batch, graph.lp)
         node_embedding = self.graph_projector(gnn_features)
+        extra = {}
+        if intervention == 'shuffle':
+            if source_graph is None:
+                raise ValueError('Shuffle requires the saved permutation source graphs')
+            extra['T_graph_original'] = node_embedding.view(-1, self.args.num_token, self.embed_dim)
+            source_h = self.GT(source_graph.x.to(dtype=dtype), source_graph.edge_index,
+                               source_graph.edge_attr, source_graph.batch, source_graph.lp)
+            extra['H_GNN_source'] = source_h
+            node_embedding = self.graph_projector(source_h)
+        elif source_graph is not None:
+            raise ValueError('Unexpected source_graph outside shuffle intervention')
+        if scale != 1.:
+            extra['T_graph_unscaled'] = node_embedding.view(-1, self.args.num_token, self.embed_dim)
+            # Compute the multiplier in FP32, then round once to injection dtype.
+            node_embedding = (node_embedding.float() * scale).to(node_embedding.dtype)
         node_embeddings = node_embedding.view(-1, self.embed_dim) # [bs * 5, dim]
 
         if node_embedding.shape[0] != input_ids.shape[0]:
             raise ValueError('Graph batch and token batch sizes differ')
         inputs_embeds = F.embedding(input_ids.masked_fill(is_node, 0), self.embed_tokens)
-        inputs_embeds[is_node] = node_embeddings.to(inputs_embeds.dtype)
+        injected = node_embeddings.to(inputs_embeds.dtype)
+        if not t.isfinite(injected).all():
+            raise FloatingPointError('Non-finite graph tokens before LLM injection')
+        inputs_embeds[is_node] = injected
 
         if return_features:
             # These are the exact states used in this forward pass, before
             # injection into the LLM; no second GNN/projector evaluation.
-            return inputs_embeds, {'H_GNN': gnn_features,
-                                   'T_graph': node_embedding.view(-1, self.args.num_token, self.embed_dim)}
+            return inputs_embeds, dict(H_GNN=gnn_features,
+                T_graph=injected.view(-1, self.args.num_token, self.embed_dim), **extra)
         return inputs_embeds # [bsz, seq, dim]
 
 

@@ -129,8 +129,21 @@ def normalize_label(text):
     return text.strip(' \t\n\r\"\'`*.,:;!?[](){}')
 
 
+EVALUATION_VERSION = 'nc-unified-v1'
+
+
 class LabelResolver:
-    def __init__(self, classes):
+    """Extract a prediction WITHOUT consulting the ground-truth answer.
+
+    strict: the previous whole-answer matcher, retained for audit.
+    unique: accept exactly one candidate mentioned with word boundaries.
+    Conservative negation/uncertainty guards are not a semantic language model;
+    rejected answers are retained for inspection, never guessed from the target.
+    """
+    def __init__(self, classes, policy='unique'):
+        if policy not in ('strict', 'unique'):
+            raise ValueError('Unknown evaluation policy: ' + str(policy))
+        self.policy = policy
         self.classes = list(classes)
         if not self.classes or len(set(self.classes)) != len(self.classes):
             raise ValueError('Classes must be nonempty and unique')
@@ -151,8 +164,11 @@ class LabelResolver:
             if key.startswith(prefix):
                 aliases[key.removeprefix('artificial intelligence, ')].add(label)
         self.aliases = {alias: next(iter(labels)) for alias, labels in aliases.items() if len(labels) == 1}
+        # Full names and the already documented arXiv/Cora aliases only.
+        self.patterns = [(re.compile(r'(?<!\w)' + re.escape(name) + r'(?!\w)'), label)
+                         for name, label in {**self.aliases, **self.exact}.items()]
 
-    def resolve(self, response):
+    def resolve_strict(self, response):
         key = normalize_label(response)
         # Accept a simple answer prefix and surrounding formatting. Do not guess
         # based on substrings/fuzzy similarity or select among multiple labels.
@@ -160,36 +176,133 @@ class LabelResolver:
         key = normalize_label(key)
         return self.exact.get(key, self.aliases.get(key))
 
+    def resolve_detail(self, response):
+        if not isinstance(response, str):
+            raise ValueError('An LLM response must be a string')
+        strict = self.resolve_strict(response)
+        if strict is not None:
+            return dict(label=strict, reason='exact_or_alias', candidates=[strict])
+        if self.policy == 'strict':
+            return dict(label=None, reason='strict_unmatched', candidates=[])
+        text = normalize_label(response)
+        spans = [(match.start(), match.end(), label)
+                 for pattern, label in self.patterns for match in pattern.finditer(text)]
+        # A complete, more specific name wins over a name contained inside it;
+        # separate mentions of different categories still remain ambiguous.
+        spans = [(a, b, label) for a, b, label in spans if not any(
+            c <= a and b <= d and (c < a or b < d) for c, d, _ in spans)]
+        candidates = sorted({label for _, _, label in spans})
+        if len(candidates) != 1:
+            return dict(label=None, reason='multiple_candidates' if candidates else 'no_candidate',
+                        candidates=candidates)
+        # Reject uncertain or negative prose conservatively. This deliberately
+        # sacrifices some recall instead of crediting "not Type 1 diabetes".
+        negative = r"\b(?:not|no|never|neither|nor|cannot|can't|won't|without)\b|\b\w+n['\u2019]t\b"
+        uncertain = (r'\b(?:unclear|unknown|unsure|uncertain|insufficient|unable|'
+                     r'undetermined|ambiguous|whether|might|maybe|possibly|perhaps)\b|'
+                     r'\b(?:could|may)\s+be\b|\b(?:rather than|instead of)\b')
+        if re.search(negative, text):
+            reason = 'negation_or_exclusion'
+        elif re.search(uncertain, text):
+            reason = 'uncertain_answer'
+        else:
+            return dict(label=candidates[0], reason='unique_candidate', candidates=candidates)
+        return dict(label=None, reason=reason, candidates=candidates)
 
-def node_classification_metrics(predictions, references, classes):
+    def resolve(self, response):
+        return self.resolve_detail(response)['label']
+
+
+def _classification_counts(predicted, targets, classes):
+    support, selected = Counter(targets), Counter(p for p in predicted if p is not None)
+    correct = Counter(target for target, pred in zip(targets, predicted) if target == pred)
+    per_class = {}
+    for label in classes:
+        tp, fp, fn = correct[label], selected[label] - correct[label], support[label] - correct[label]
+        per_class[label] = dict(support=support[label], true_positive=tp, false_positive=fp, false_negative=fn,
+                                precision=tp / (tp + fp) if tp + fp else 0.,
+                                recall=tp / (tp + fn) if tp + fn else 0.,
+                                f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.)
+    return dict(accuracy=sum(correct.values()) / len(targets) if targets else None,
+                macro_f1=sum(row['f1'] for row in per_class.values()) / len(classes) if targets else None,
+                per_class=per_class)
+
+
+def node_classification_metrics(predictions, references, classes, policy='unique'):
     if not predictions or len(predictions) != len(references):
         raise ValueError('Predictions and references must have the same nonzero length')
-    resolver = LabelResolver(classes)
+    resolver = LabelResolver(classes, policy=policy)
     targets = []
     for reference in references:
         target = resolver.exact.get(normalize_label(reference))
         if target is None:
             raise ValueError(f'Unknown reference label: {reference}')
         targets.append(target)
-    predicted = [resolver.resolve(response) for response in predictions]
-    support, selected = Counter(targets), Counter(p for p in predicted if p is not None)
-    correct = Counter(target for target, pred in zip(targets, predicted) if target == pred)
-    per_class = {}
-    for label in resolver.classes:
-        tp, fp, fn = correct[label], selected[label] - correct[label], support[label] - correct[label]
-        per_class[label] = dict(support=support[label], true_positive=tp, false_positive=fp, false_negative=fn,
-                                precision=tp / (tp + fp) if tp + fp else 0.,
-                                recall=tp / (tp + fn) if tp + fn else 0.,
-                                f1=2 * tp / (2 * tp + fp + fn) if 2 * tp + fp + fn else 0.)
+    details = [resolver.resolve_detail(response) for response in predictions]
+    predicted = [d['label'] for d in details]
+    full = _classification_counts(predicted, targets, resolver.classes)
+    legal = [(p, y) for p, y in zip(predicted, targets) if p is not None]
+    legal_metrics = _classification_counts([p for p, _ in legal], [y for _, y in legal], resolver.classes)
+    strict = [resolver.resolve_strict(response) for response in predictions]
+    strict_metrics = _classification_counts(strict, targets, resolver.classes)
+    strict_metrics.pop('per_class')
+    strict_metrics['valid_answer_rate'] = sum(p is not None for p in strict) / len(targets)
     invalid = sum(label is None for label in predicted)
     report = dict(task='node_classification', num_samples=len(targets), num_classes=len(resolver.classes),
-                  accuracy=sum(correct.values()) / len(targets),
-                  macro_f1=sum(row['f1'] for row in per_class.values()) / len(per_class),
+                  **full, macro_f1_all=full['macro_f1'], macro_f1_legal=legal_metrics['macro_f1'],
+                  num_valid=len(legal), legal_per_class=legal_metrics['per_class'],
                   valid_answer_rate=1 - invalid / len(targets), invalid_answers=invalid,
-                  evaluation_policy='all_examples; invalid predictions count as errors; macro F1 over dataset classes; zero_division=0',
-                  label_mapping='normalized exact match; arXiv code/name aliases; released Cora ML hierarchy aliases; no fuzzy matching',
-                  per_class=per_class)
+                  evaluation_version=EVALUATION_VERSION, parser_policy=policy,
+                  evaluation_policy='Accuracy and macro_f1/macro_f1_all: all examples, invalid=error/FN; '
+                                    'macro_f1_legal: valid examples only; all dataset classes; zero_division=0; '
+                                    'no legal examples => macro_f1_legal=null',
+                  label_mapping='normalized exact/alias' if policy == 'strict' else
+                                'exact/alias then unique boundary-matched candidate; conservative negation/uncertainty guards',
+                  resolution_counts=dict(Counter(d['reason'] for d in details)), strict_metrics=strict_metrics)
     return report, predicted
+
+
+def select_instruction_indices(count, max_samples=None, sample_count=None, sample_seed=2026):
+    """Use a private RNG: subset selection must not consume decoding randomness."""
+    import random
+    if sample_count is not None:
+        if max_samples is not None or not 1 <= sample_count <= count:
+            raise ValueError('sample_count must be in [1, instruction count]; cannot combine with max_samples')
+        return sorted(random.Random(sample_seed).sample(range(count), sample_count))
+    return list(range(min(count, max_samples) if max_samples is not None else count))
+
+
+def token_source_indices(count, seed):
+    """Uniform rejection sampling of a permutation with NO fixed points."""
+    import random
+    if count < 2:
+        raise ValueError('Token shuffle requires at least two distinct target nodes')
+    rng = random.Random(seed)
+    while True:
+        permutation = list(range(count))
+        rng.shuffle(permutation)
+        if all(i != j for i, j in enumerate(permutation)):
+            return permutation
+
+
+def validated_selection(folder, instruction_path, config):
+    """Verify the exact cohort recorded by an inference run, using only stdlib."""
+    args = config['args']
+    references, _ = load_nc_references(instruction_path)
+    indices = select_instruction_indices(len(references), args.get('max_samples'),
+                                         args.get('sample_count'), args.get('sample_seed', 2026))
+    spec = config.get('sample_manifest')
+    if spec:
+        path = Path(folder) / 'sample_manifest.json'
+        if file_fingerprint(path)['sha256'] != spec['sha256']:
+            raise ValueError('Sample manifest fingerprint mismatch')
+        manifest = json.loads(path.read_text(encoding='utf-8'))
+        if (manifest['instruction_sha256'] != file_fingerprint(instruction_path)['sha256'] or
+                manifest['instruction_indices'] != indices or manifest['population_size'] != len(references)):
+            raise ValueError('Sample manifest differs from deterministic instruction selection')
+    elif args.get('sample_count') is not None:
+        raise ValueError('Random subsets require a sample_manifest.json')
+    return indices
 
 
 def load_nc_references(instruction_path, max_samples=None):
@@ -283,6 +396,7 @@ class FeatureStore:
         self.written[indices] = True
         self.written.flush()
         self.manifest['num_saved'] = int(self.written.sum())
+        atomic_json(self.folder / 'manifest.json', self.manifest)
 
     def close(self, complete):
         self.manifest['complete'] = bool(complete)
@@ -296,6 +410,12 @@ def recover_features(run_dir):
     import numpy as np
     import torch
     run_dir = Path(run_dir)
+    # A stale partial feature_store must never replace a complete final tensor
+    # package (e.g. after copying files from the server at different times).
+    existing = list(run_dir.glob('features_*.pt'))
+    if existing:
+        raise FileExistsError(f'Final feature file already exists: {existing[0]}; '
+                              'recovery is only for runs without a final feature file')
     folder = run_dir / 'feature_store'
     manifest = json.loads((folder / 'manifest.json').read_text(encoding='utf-8'))
     written = np.load(folder / 'written.npy', mmap_mode='r')
@@ -344,7 +464,8 @@ class InferenceRecorder:
         self.predictions = [None] * len(dataset)
         self.seen = set()
         self.nc = set(dataset.instructions['task']) == {'nc'}
-        self.resolver = LabelResolver(dataset.class_labels if self.nc else sorted(set(self.references)))
+        self.resolver = LabelResolver(dataset.class_labels if self.nc else sorted(set(self.references)),
+                                      policy=getattr(args, 'evaluation_policy', 'unique') if self.nc else 'strict')
         self.settings = dict(decoding_settings)
         self.settings.update(seed=args.run_seed, backbone=args.backbone, source_dataset=args.dataset,
                              test_dataset=args.test_dataset, method=args.method, batch_size=args.batch_size,
@@ -366,12 +487,46 @@ class InferenceRecorder:
             instruction_file=file_fingerprint(dataset.instruction_path),
             projector_checkpoint=file_fingerprint(checkpoint) if checkpoint else None,
             source_files={str(p.relative_to(root)): file_fingerprint(p)['sha256'] for p in source_files},
+            evaluation_version=EVALUATION_VERSION, parser_policy=self.resolver.policy,
             text_baseline_definition='Same instruction preprocessing; remove <Node N> placeholders only; no GNN/projector',
             feature_note='X is the released node feature matrix, not LLM hidden states; H_GNN/T_graph do not exist for vicuna_text')
+        instruction_indices = getattr(dataset, 'instruction_indices', list(range(len(dataset))))
+        selection = dict(schema_version=1, population_size=getattr(dataset, 'population_size', len(dataset)),
+            instruction_sha256=self.run_config['instruction_file']['sha256'],
+            instruction_indices=instruction_indices,
+            node_ids=[int(row[0]) for row in dataset.instructions['node_set']],
+            sample_seed=getattr(args, 'sample_seed', 2026), sample_count=getattr(args, 'sample_count', None),
+            definition='Uniform without replacement, sorted original rows; independent of decoding RNG' if
+                getattr(args, 'sample_count', None) is not None else 'Original instruction order')
+        atomic_json(self.folder / 'sample_manifest.json', selection)
+        self.run_config['sample_manifest'] = file_fingerprint(self.folder / 'sample_manifest.json')
+        sources = getattr(dataset, 'token_sources', None)
+        intervention = dict(schema_version=1, graph_intervention=getattr(args, 'graph_intervention', 'none'),
+            graph_token_scale=getattr(args, 'graph_token_scale', 1.), shuffle_seed=getattr(args, 'shuffle_seed', 2026),
+            shuffle_scope='selected_evaluation_cohort',
+            self_only_definition='Empty edge_index at every GNN layer; retain root transform and biases; no added self loops',
+            feature_definitions=dict(H_GNN='Target graph GNN output (after edge removal for self_only)',
+                T_graph='Actual tokens injected after replacement/scaling and casting to LLM embedding dtype',
+                T_graph_original='Unmodified target graph tokens, only present for shuffle',
+                H_GNN_source='GNN output of permutation donor, only present for shuffle',
+                T_graph_unscaled='Tokens immediately before non-unit scaling, only present when scale != 1'),
+            note='Small-sample shuffle is within the selected cohort; full runs permute the full test set. Donor graphs are recomputed with frozen weights; floating-point batching differences may occur.')
+        if sources is not None:
+            mapping = [dict(sample_index=i, instruction_index=instruction_indices[i], node_id=selection['node_ids'][i],
+                            source_sample_index=j, source_instruction_index=instruction_indices[j],
+                            source_node_id=selection['node_ids'][j]) for i, j in enumerate(sources)]
+            atomic_json(self.folder / 'token_permutation.json', mapping)
+            intervention['permutation_file'] = file_fingerprint(self.folder / 'token_permutation.json')
+        atomic_json(self.folder / 'intervention.json', intervention)
+        self.run_config['intervention'] = intervention
         atomic_json(self.folder / 'run_config.json', self.run_config)
         atomic_json(self.folder / 'generation_config.json', self.settings)
         self.log = (self.folder / f'predictions_{args.test_dataset}.jsonl').open('x', encoding='utf-8')
         self.features = FeatureStore(self.folder, len(dataset), args.test_dataset, args.method) if args.save_features else None
+        if self.features:
+            self.features.manifest['intervention'] = intervention
+            self.features.manifest['sample_manifest_sha256'] = self.run_config['sample_manifest']['sha256']
+            atomic_json(self.features.folder / 'manifest.json', self.features.manifest)
 
     def write_batch(self, indices, outputs, raw_outputs, output_tokens, input_tokens, graph_features=None):
         import torch
@@ -383,15 +538,23 @@ class InferenceRecorder:
         for i, output, raw, generated, inputs in zip(indices, outputs, raw_outputs, output_tokens, input_tokens):
             row = self.dataset.instructions.iloc[i]
             node_id = int(row['node_set'][0])
-            parsed = self.resolver.resolve(output)
+            resolution = self.resolver.resolve_detail(output)
+            parsed = resolution['label']
             target = self.resolver.exact[normalize_label(row['output'])]
             records.append(dict(sample_index=i, node_id=node_id, true_label=row['output'],
                 llm_raw_output=output, parsed_pred=parsed, is_correct=parsed == target,
                 valid_answer=parsed is not None, llm_output_with_special_tokens=raw,
+                parse_reason=resolution['reason'], mentioned_candidates=resolution['candidates'],
+                evaluation_version=EVALUATION_VERSION, parser_policy=self.resolver.policy,
                 generated_token_ids=generated, input_token_ids=inputs, prompt=self.dataset.prompt_text(i),
                 target_node_ids=[int(n) for n in row['node_set'][:2 if row['task'] == 'lp' else 1]],
                 dataset=self.args.test_dataset, source_dataset=self.args.dataset, method=self.args.method,
                 seed=self.args.run_seed, feature_row=i if self.features else None))
+            records[-1]['instruction_index'] = getattr(self.dataset, 'instruction_indices', range(len(self.dataset)))[i]
+            if getattr(self.dataset, 'token_sources', None) is not None:
+                source = self.dataset.token_sources[i]
+                records[-1].update(token_source_sample_index=source,
+                    token_source_node_id=int(self.dataset.instructions.iloc[source]['node_set'][0]))
             if self.features:
                 graph = self.dataset.name2data[row['data']]
                 selected = row['node_set'][:2 if row['task'] == 'lp' else 1]
@@ -411,6 +574,8 @@ class InferenceRecorder:
             self.predictions[i] = output
             self.seen.add(i)
         atomic_json(self.folder / 'progress.json', dict(num_completed=len(self.seen), num_expected=len(self.dataset)))
+        self.run_config['num_completed'] = len(self.seen)
+        atomic_json(self.folder / 'run_config.json', self.run_config)
         if self.args.verbose:
             from tqdm import tqdm
             for record in records:
@@ -440,7 +605,8 @@ class InferenceRecorder:
         atomic_json(self.parent / f'{self.args.prefix}_generation_config.json', self.settings)
         metrics = None
         if self.nc:
-            metrics, mapped = node_classification_metrics(self.predictions, self.references, self.dataset.class_labels)
+            metrics, mapped = node_classification_metrics(self.predictions, self.references, self.dataset.class_labels,
+                                                           policy=self.resolver.policy)
             atomic_json(self.folder / 'metrics.json', metrics)
             atomic_json(self.parent / f'{self.args.prefix}_metrics.json', metrics)
             atomic_json(self.parent / f'{self.args.prefix}_predicted_labels.json', mapped)
@@ -449,7 +615,7 @@ class InferenceRecorder:
         return metrics
 
 
-def read_predictions(path, instruction_path, references):
+def read_predictions(path, instruction_path, references, instruction_indices=None):
     """Accept legacy text arrays or validate/reorder the per-node JSONL log."""
     path = Path(path)
     if path.suffix.lower() != '.jsonl':
@@ -475,6 +641,8 @@ def read_predictions(path, instruction_path, references):
         node_sets = [instructions['node_set'][key] for key in keys]
     else:
         node_sets = instructions['node_set']
+    if instruction_indices is not None:
+        node_sets = [node_sets[i] for i in instruction_indices]
     predictions = []
     for i, reference in enumerate(references):
         record = ordered[i]
@@ -482,10 +650,67 @@ def read_predictions(path, instruction_path, references):
             raise ValueError(f'JSONL reference label does not match instruction {i}')
         if record.get('node_id') != int(node_sets[i][0]):
             raise ValueError(f'JSONL node ID does not match instruction {i}')
+        if instruction_indices is not None and record.get('instruction_index') != instruction_indices[i]:
+            raise ValueError(f'JSONL original instruction index does not match selection row {i}')
         if not isinstance(record.get('llm_raw_output'), str):
             raise ValueError(f'JSONL raw output is missing at instruction {i}')
         predictions.append(record['llm_raw_output'])
     return predictions
+
+
+def evaluate_saved_predictions(prediction_path, instruction_path, output, *, policy='unique',
+                               max_samples=None, parsed_output=None, instruction_indices=None):
+    """CPU-only scoring; preserve raw run files and record input fingerprints."""
+    output = Path(output)
+    parsed_output = Path(parsed_output) if parsed_output else None
+    if parsed_output is not None and output.resolve() == parsed_output.resolve():
+        raise ValueError('Metric JSON and per-node JSONL must have different paths')
+    for path in (output, parsed_output):
+        if path is not None and path.exists():
+            raise FileExistsError(f'Refusing to overwrite {path}; choose a new output path')
+    config_path = Path(prediction_path).parent / 'run_config.json'
+    if instruction_indices is None and Path(prediction_path).suffix == '.jsonl' and config_path.exists():
+        config = json.loads(config_path.read_text(encoding='utf-8'))
+        if config.get('sample_manifest'):
+            if config['status'] != 'complete':
+                raise ValueError('Refusing to score an incomplete inference run')
+            instruction_indices = validated_selection(config_path.parent, instruction_path, config)
+    references, classes = load_nc_references(instruction_path, max_samples)
+    if instruction_indices is not None:
+        if max_samples is not None:
+            raise ValueError('Do not combine max_samples with an explicit selection')
+        references = [references[i] for i in instruction_indices]
+    predictions = read_predictions(prediction_path, instruction_path, references, instruction_indices)
+    metrics, mapped = node_classification_metrics(predictions, references, classes, policy=policy)
+    metrics['inputs'] = dict(predictions=file_fingerprint(prediction_path),
+                            instructions=file_fingerprint(instruction_path))
+    if instruction_indices is not None:
+        metrics['inputs']['instruction_indices'] = instruction_indices
+    metrics['evaluator_sha256'] = file_fingerprint(__file__)['sha256']
+    if parsed_output:
+        data = json.loads(Path(instruction_path).read_text(encoding='utf-8'))
+        if isinstance(data, list):
+            nodes = [row['node_set'][0] for row in data]
+        elif isinstance(data['node_set'], dict):
+            nodes = [data['node_set'][key][0] for key in data.get('prompt', data['node_set'])]
+        else:
+            nodes = [values[0] for values in data['node_set']]
+        if instruction_indices is not None:
+            nodes = [nodes[i] for i in instruction_indices]
+        resolver = LabelResolver(classes, policy)
+        parsed_output.parent.mkdir(parents=True, exist_ok=True)
+        with parsed_output.open('x', encoding='utf-8') as handle:
+            for i, (raw, target, pred) in enumerate(zip(predictions, references, mapped)):
+                detail = resolver.resolve_detail(raw)
+                handle.write(json.dumps(dict(sample_index=i, node_id=int(nodes[i]), true_label=target,
+                    instruction_index=instruction_indices[i] if instruction_indices is not None else i,
+                    llm_raw_output=raw, parsed_pred=pred, is_correct=pred == target,
+                    valid_answer=pred is not None, parse_reason=detail['reason'],
+                    mentioned_candidates=detail['candidates'], parser_policy=policy,
+                    evaluation_version=EVALUATION_VERSION), ensure_ascii=False) + '\n')
+    output.parent.mkdir(parents=True, exist_ok=True)
+    atomic_json(output, metrics)
+    return metrics
 
 
 def _evaluation_main():
@@ -494,22 +719,78 @@ def _evaluation_main():
     parser.add_argument('--instructions', type=Path, help='The matching *_dataset_test.json')
     parser.add_argument('--max_samples', type=int, default=None, help='Use the same value as the generation command')
     parser.add_argument('--output', type=Path)
+    parser.add_argument('--policy', choices=['unique', 'strict'], default='unique')
+    parser.add_argument('--parsed-output', type=Path, help='New per-node audit JSONL; original logs are not changed')
+    parser.add_argument('--results-root', type=Path, help='Score all complete legacy output arrays under this experiment')
+    parser.add_argument('--instruction-dir', type=Path, default=Path(__file__).resolve().parents[1] / 'instruction')
+    parser.add_argument('--datasets', nargs='+', default=['pubmed', 'history', 'children', 'sports'])
+    parser.add_argument('--output-dir', type=Path, help='New directory for batch evaluation; refuses overwrite')
     parser.add_argument('--recover-features', type=Path, help='Finalize a retained feature_store in this run directory on CPU')
     args = parser.parse_args()
     if args.recover_features:
         print(f'Saved {recover_features(args.recover_features)}')
         return
+    if args.results_root:
+        if not args.output_dir or args.output_dir.exists():
+            parser.error('--output-dir must name a new directory for batch evaluation')
+        if any((args.predictions, args.instructions, args.output, args.parsed_output, args.max_samples)):
+            parser.error('Do not combine batch evaluation with single-file/subset options')
+        summary = []
+        for dataset in args.datasets:
+            instruction = args.instruction_dir / dataset / f'{dataset}_dataset_test.json'
+            for prediction in sorted((args.results_root / dataset).glob('*_model_results.txt')):
+                prefix = prediction.name.removesuffix('_model_results.txt')
+                destination = args.output_dir / dataset / prefix
+                try:
+                    references, _ = load_nc_references(instruction)
+                    selection = None
+                    config_path = prediction.parent / prefix / 'run_config.json'
+                    if config_path.exists():
+                        config = json.loads(config_path.read_text(encoding='utf-8'))
+                        if config['status'] != 'complete':
+                            raise ValueError('Run is not complete')
+                        expected_hash = config.get('instruction_file', {}).get('sha256')
+                        if expected_hash and file_fingerprint(instruction)['sha256'] != expected_hash:
+                            raise ValueError('Instruction hash differs from the generation run')
+                        selection = validated_selection(config_path.parent, instruction, config)
+                        references = [references[i] for i in selection]
+                        if config['num_expected'] != len(references) or config['num_completed'] != len(references):
+                            raise ValueError('Run count differs from sample selection')
+                    labels_path = prediction.with_name(prefix + '_model_labels.txt')
+                    if json.loads(labels_path.read_text(encoding='utf-8')) != references:
+                        raise ValueError('Saved labels do not match the recorded instruction selection')
+                    # New diagnostic runs have durable row IDs: verify them,
+                    # rather than relying on a same-class label array alone.
+                    scoring_path = prediction
+                    if config_path.exists() and config.get('sample_manifest'):
+                        scoring_path = config_path.parent / f'predictions_{dataset}.jsonl'
+                        verified = read_predictions(scoring_path, instruction, references, selection)
+                        if verified != json.loads(prediction.read_text(encoding='utf-8')):
+                            raise ValueError('Legacy output array and durable JSONL disagree')
+                    metrics = evaluate_saved_predictions(scoring_path, instruction, destination / 'metrics.json',
+                        policy=args.policy, parsed_output=destination / 'predictions_evaluated.jsonl',
+                        instruction_indices=selection)
+                    row = dict(dataset=dataset, run=prefix, **{k: metrics[k] for k in
+                        ('num_samples', 'accuracy', 'macro_f1_all', 'macro_f1_legal', 'valid_answer_rate', 'strict_metrics')})
+                    summary.append(row)
+                    print(json.dumps(row, ensure_ascii=False))
+                except (ValueError, FileNotFoundError) as exc:
+                    parser.error(f'{dataset}/{prefix}: {exc}')
+        if not summary:
+            parser.error('No complete *_model_results.txt outputs found')
+        atomic_json(args.output_dir / 'summary.json', dict(evaluation_version=EVALUATION_VERSION,
+            parser_policy=args.policy, evaluator_sha256=file_fingerprint(__file__)['sha256'], runs=summary,
+            note='Scored complete raw output/label arrays; this does not certify completeness of separate logs or feature stores'))
+        return
     if not all((args.predictions, args.instructions, args.output)):
         parser.error('--predictions, --instructions and --output are required for scoring')
     try:
-        references, classes = load_nc_references(args.instructions, args.max_samples)
-        predictions = read_predictions(args.predictions, args.instructions, references)
-        metrics, _ = node_classification_metrics(predictions, references, classes)
-    except ValueError as exc:
+        metrics = evaluate_saved_predictions(args.predictions, args.instructions, args.output,
+            policy=args.policy, max_samples=args.max_samples, parsed_output=args.parsed_output)
+    except (ValueError, FileExistsError) as exc:
         parser.error(str(exc))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(metrics, ensure_ascii=False, indent=2), encoding='utf-8')
     print(f"Accuracy={metrics['accuracy']:.6f}, Macro F1={metrics['macro_f1']:.6f}, "
+          f"Macro F1 (legal)={metrics['macro_f1_legal']}, "
           f"Valid answers={metrics['valid_answer_rate']:.6f}; saved {args.output}")
 
 

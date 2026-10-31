@@ -5,7 +5,7 @@ from pathlib import Path
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from torch_geometric.data import Data, Batch
-from .utils import load_checkpoint
+from .utils import load_checkpoint, select_instruction_indices, token_source_indices
 from .conversation import conv_templates
 
 IGNORE_TOKEN_ID = -100
@@ -63,8 +63,20 @@ class InstructionDataset(Dataset):
         name = args.test_dataset if args.inference else args.dataset
         instruction_path = Path(args.instruction_dir) / name / f'{name}_dataset_{mode}.json'
         self.instruction_path = instruction_path
-        self.instructions = get_instructions(instruction_path, args.max_samples)
-        self.class_labels = self.instructions.attrs['class_labels']
+        full = get_instructions(instruction_path)
+        self.class_labels = full.attrs['class_labels']
+        self.population_size = len(full)
+        self.instruction_indices = select_instruction_indices(len(full), args.max_samples,
+            getattr(args, 'sample_count', None), getattr(args, 'sample_seed', 2026))
+        self.instructions = full.iloc[self.instruction_indices].copy().reset_index(drop=True)
+        self.token_sources = None
+        changed = getattr(args, 'graph_intervention', 'none') != 'none' or getattr(args, 'graph_token_scale', 1.) != 1.
+        if changed and (set(self.instructions['task']) != {'nc'} or len(set(self.instructions['data'])) != 1):
+            raise ValueError('Interventions require single-dataset node classification')
+        if getattr(args, 'graph_intervention', 'none') == 'shuffle':
+            if len({int(nodes[0]) for nodes in self.instructions['node_set']}) != len(self.instructions):
+                raise ValueError('Shuffle requires distinct target node IDs')
+            self.token_sources = token_source_indices(len(self.instructions), args.shuffle_seed)
         self.text_only = args.method == 'vicuna_text'
         if self.text_only and set(self.instructions['task']) != {'nc'}:
             raise ValueError('The text-only comparison is defined for node classification')
@@ -122,6 +134,17 @@ class InstructionDataset(Dataset):
             # No subgraph or graph-derived embeddings enter the baseline LLM.
             out['is_node'] = torch.zeros_like(out['input_ids'], dtype=torch.bool)
             return out
+        out['graph'] = self.make_graph(idx)
+        if self.token_sources is not None:
+            out['source_graph'] = self.make_graph(self.token_sources[idx])
+        out['is_node'] = (out['input_ids'].unsqueeze(-1) == self.node_token_ids).any(-1)
+        if out['is_node'].sum().item() != self.args.num_token:
+            raise ValueError(f'Instruction {idx} must contain exactly {self.args.num_token} graph tokens')
+        return out
+
+    def make_graph(self, idx):
+        # Keep original instruction edges intact for post-hoc homophily bins.
+        instruction = self.instructions.iloc[idx]
         node_list = torch.tensor(instruction['node_set'], dtype=torch.long)
         edge_index = torch.tensor(instruction['edge_index'], dtype=torch.long).reshape(2, -1)
         if node_list.numel() == 0 or (instruction['task'] == 'lp' and node_list.numel() < 2):
@@ -131,12 +154,8 @@ class InstructionDataset(Dataset):
         if instruction['task'] == 'lp' and self.args.remove_target_edge:
             target_edge = ((edge_index[0] == 0) & (edge_index[1] == 1)) | ((edge_index[0] == 1) & (edge_index[1] == 0))
             edge_index = edge_index[:, ~target_edge]
-        out['graph'] = Data(x=self.name2data[instruction['data']].x[node_list].float(),
-                            edge_index=edge_index, lp=instruction['task'] == 'lp')
-        out['is_node'] = (out['input_ids'].unsqueeze(-1) == self.node_token_ids).any(-1)
-        if out['is_node'].sum().item() != self.args.num_token:
-            raise ValueError(f'Instruction {idx} must contain exactly {self.args.num_token} graph tokens')
-        return out
+        return Data(x=self.name2data[instruction['data']].x[node_list].float(),
+                    edge_index=edge_index, lp=instruction['task'] == 'lp')
 
     def collate_fn(self, batch):
         def pad(key, value, left=False):
@@ -153,4 +172,6 @@ class InstructionDataset(Dataset):
                     sample_index=torch.tensor([entry['sample_index'] for entry in batch], dtype=torch.long))
         if not self.text_only:
             collated['graph'] = Batch.from_data_list([entry['graph'] for entry in batch])
+            if self.token_sources is not None:
+                collated['source_graph'] = Batch.from_data_list([entry['source_graph'] for entry in batch])
         return collated

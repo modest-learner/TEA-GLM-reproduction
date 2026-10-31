@@ -22,6 +22,8 @@ def parse_args(parse=True, **optional_kwargs):
     parser.add_argument('--projector_checkpoint', default='', help='Explicit first_model checkpoint; accepts the published TEA-GLM_*.pth files')
     parser.add_argument('--model_checkpoint', default='', help='Optional fine-tuned LLM checkpoint')
     parser.add_argument('--max_samples', type=int, default=None, help='Optional deterministic subset for smoke tests; default uses all instructions')
+    parser.add_argument('--sample_count', type=int, default=None, help='Inference: fixed uniform random subset, sorted in original instruction order')
+    parser.add_argument('--sample_seed', type=int, default=2026, help='Subset seed, independent of decoding seed')
     parser.add_argument('--device', default='auto', choices=['auto', 'cpu', 'cuda'])
     parser.add_argument('--dtype', default='auto', choices=['auto', 'float32', 'float16', 'bfloat16'])
     parser.add_argument('--log_with', default=None, choices=['wandb', 'tensorboard'])
@@ -64,11 +66,17 @@ def parse_args(parse=True, **optional_kwargs):
     parser.add_argument('--best_epoch', type=int, default=0)
 
     # Inference
+    parser.add_argument('--graph_intervention', choices=['none', 'self_only', 'shuffle'], default='none',
+                        help='self_only removes ALL edges, retains GraphSAGE root branch; shuffle moves whole five-token groups')
+    parser.add_argument('--graph_token_scale', type=float, default=1.0, help='Positive multiplier after projector, before LLM injection; inference only')
+    parser.add_argument('--shuffle_seed', type=int, default=2026, help='Fixed derangement seed, independent of decoding seed')
     parser.add_argument('--method', choices=['tea_glm', 'vicuna_text'], default='tea_glm',
                         help='vicuna_text removes only graph placeholders from the shared instruction')
     parser.add_argument('--save_features', action='store_true',
                         help='Persist X and, for TEA-GLM, H_GNN/T_graph for CPU diagnostics')
     parser.add_argument('--verbose', action='store_true', help='Print each prediction in addition to the durable JSONL log')
+    parser.add_argument('--evaluation_policy', choices=['unique', 'strict'], default='unique',
+                        help='Versioned answer extraction; does not change prompts or generation')
     parser.add_argument('--gen_max_length', type=int, default=80)
     parser.add_argument('--do_sample', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--temperature', type=float, default=0.7)
@@ -97,6 +105,14 @@ def parse_args(parse=True, **optional_kwargs):
             parser.error(f'--{key} must be positive')
     if kwargs['max_samples'] is not None and kwargs['max_samples'] < 1:
         parser.error('--max_samples must be positive')
+    if kwargs['sample_count'] is not None:
+        if kwargs['sample_count'] < 1 or kwargs['max_samples'] is not None or not kwargs['inference']:
+            parser.error('--sample_count must be positive, inference-only, and cannot accompany --max_samples')
+    if not math.isfinite(kwargs['graph_token_scale']) or kwargs['graph_token_scale'] <= 0:
+        parser.error('--graph_token_scale must be finite and positive')
+    changed = kwargs['graph_intervention'] != 'none' or kwargs['graph_token_scale'] != 1.0
+    if changed and (not kwargs['inference'] or kwargs['method'] != 'tea_glm' or not kwargs['save_features']):
+        parser.error('Graph interventions require --inference --method tea_glm --save_features')
     if not math.isfinite(kwargs['temperature']) or kwargs['temperature'] <= 0:
         parser.error('--temperature must be finite and positive')
     if kwargs['top_p'] is not None and not 0 < kwargs['top_p'] <= 1:
